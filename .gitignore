@@ -1,1 +1,4 @@
 *.csv
+/pythonProject/web_data
+/.idea
+/pythonProject

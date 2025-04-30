@@ -2,8 +2,10 @@ import asyncio
 import json
 import random
 import time
+from asyncio import wait_for
 from time import sleep
 import lxml
+import platform
 from bs4 import BeautifulSoup
 import chardet
 import pandas as pd
@@ -16,6 +18,10 @@ import os
 
 if not os.path.exists("screenshots"):
     os.makedirs("screenshots")
+
+if not os.path.exists("web_data"):
+    os.makedirs("web_data")
+
 
 def store_first_db():
 
@@ -65,7 +71,7 @@ def load_10_restaurant_names_and_addresses():
     conn = sqlite3.connect('food_data.db')
     cursor = conn.cursor()
 
-    cursor.execute("SELECT 사업장명, 도로명전체주소 FROM restaurants ;")
+    cursor.execute("SELECT 사업장명, 도로명전체주소 FROM restaurants LIMIT 50;")
     rows = cursor.fetchall()
 
     conn.close()
@@ -162,6 +168,43 @@ def extract_menu_data_from_html(html_content):
 
     return menu_items
 
+
+def extract_dynamic_place_info(soup: BeautifulSoup):
+    place_info = {}
+
+    info_blocks = soup.select("div.PIbes > div.O8qbU")
+
+    for block in info_blocks:
+        key_elem = block.select_one("strong > span.place_blind")
+        value_block = block.select_one("div.vV_z_")
+        if not key_elem or not value_block:
+            continue
+
+        key = key_elem.get_text(strip=True)
+
+        if key == "주소":
+            addr = value_block.select_one("span.LDgIH")
+            place_info["주소"] = addr.text.strip() if addr else None
+
+        elif key == "전화번호":
+            phone = value_block.select_one("span.xlx7Q")
+            place_info["전화번호"] = phone.text.strip() if phone else None
+
+        elif key == "영업시간":
+            status = value_block.select_one("em")
+            hours = value_block.select_one("time")
+            place_info["영업상태"] = status.text.strip() if status else None
+            place_info["영업시간"] = hours.text.strip() if hours else None
+
+        elif key == "홈페이지":
+            links = value_block.select("a.place_bluelink")
+            place_info["홈페이지들"] = [a["href"] for a in links if a.get("href")]
+
+        else:
+            place_info[key] = value_block.get_text(strip=True)
+
+    return place_info
+
 async def crawler():
     restaurant_infos = load_10_restaurant_names_and_addresses()
     if not restaurant_infos:
@@ -172,9 +215,27 @@ async def crawler():
     if not os.path.exists("screenshots"):
         os.makedirs("screenshots")
 
+    system = platform.platform()
+    arch = platform.machine()
+    executable = None
+
+    print("시스템 정보 확인")
+    print(f"시스템: {system}")
+    print(f"아키텍처: {arch}")
+
+    if system != "mac" and arch in ("aarch64", "arm64"):
+        print("ARM64 환경 감지")
+        if os.path.exists("/usr/bin/ungoogled-chromium"):
+            executable = "/usr/bin/ungoogled-chromium"
+        elif os.path.exists("/usr/bin/chromium"):
+            executable = "/usr/bin/chromium"
+
     try:
         print("🚀 Zendriver 시작 중...")
-        browser = await zd.start(headless=True)
+        print(f" 브라우저 실행 위치. {executable}")
+        browser = await zd.start(
+            browser_executable_path=executable,
+        )
         print("✅ Zendriver 시작 완료. 브라우저 객체 확보.")
 
         results = []
@@ -183,71 +244,103 @@ async def crawler():
             search_query = make_search_query(business_name, road_address)
             encoded_query = urllib.parse.quote(search_query) # URL 인코딩
             search_url = f"https://map.naver.com/p/search/{encoded_query}"
+            mob_search_url = f"https://m.place.naver.com/restaurant/list?query={encoded_query}&x=126&y=37"
 
             print(f"\n--- {index+1}/{len(restaurant_infos)} 처리 중: {search_query} ---")
-            print(f"🔗 URL: {search_url}")
+            print(f"🔗 URL: {mob_search_url}")
 
             try:
                 # 1. browser.get()으로 이동하고, 반환된 page/tab 객체를 사용
-                page = await browser.get(search_url)
+                page = await browser.get(mob_search_url)
                 print("🌐 페이지 이동 완료. 콘텐츠 로딩 대기 중...") # browser.get이 완료될 때까지 기다린다고 가정
 
+                await page.wait(t=3)  # 페이지 로딩 대기
                 # --- 이제 'page' (Tab 객체)를 사용하여 요소 찾기 ---
-                search_iframe_selector = "#searchIframe"
-                entry_iframe_selector = "#entryIframe"
+                place_business_list_wrapper = "div.place_business_list_wrapper"
+                place_fixed_maintab_selector = "div.place_fixed_maintab"
 
-                pprint.pprint("🔄 searchIframe 로딩 대기중...")
-                await page.wait_for(search_iframe_selector, timeout=10000)
-                pprint.pprint("✅ searchIframe 로딩 완료.")
+                pprint.pprint("🔄 place_business_list_wrapper 로딩 대기중...")
+                await page.wait_for(place_business_list_wrapper, timeout=10000)
+                pprint.pprint("✅ place_business_list_wrapper 로딩 완료.")
 
-                # tmp_content = await page.get_content()
-                pprint.pprint('SearchIframe url 확인중')
-                iframe_elements_str_list = await page.select_all("#searchIframe")
-                iframe_string = str(iframe_elements_str_list[0])
-                match = re.search(r'src="([^"]*)"', iframe_string)
-                pprint.pprint(f"iframe URL: {match.group(1)}")
-
-                await page.get(match.group(1))
                 tmp_content = await page.get_content()
                 tmp_parse = BeautifulSoup(tmp_content, "lxml")
-
                 if tmp_parse.select("div[class='FYvSc']"):
                     pprint.pprint("❌ 검색 결과 없음.")
+                    await page.save_screenshot(f"screenshots/no_store_{index + 1}_{business_name}_{road_address}.png")
                     continue
+                a_tags = tmp_parse.select("div.place_business_list_wrapper > ul > li a[href]")
+                href_list = [a['href'] for a in a_tags]
+                valid_links = [
+                    re.match(r"^/restaurant/\d+", href).group(0)
+                    for href in href_list
+                    if re.match(r"^/restaurant/\d+", href)
+                ]
 
-                await page.get(search_url)
-                pprint.pprint("🔄 entryIframe 로딩 대기중...")
-                # await page.wait_for(search_iframe_selector, timeout=10000)
-                await page.wait_for(entry_iframe_selector, timeout=10)
-                pprint.pprint("✅ entryIframe 로딩 완료.")
-                iframe_elements_str_list = await page.select_all("#entryIframe")
-                iframe_string = str(iframe_elements_str_list[0])
-                match = re.search(r'src="([^"]*)"', iframe_string)
-                pprint.pprint(f"iframe URL: {match.group(1)}")
-                await page.get(match.group(1))
-                content = await page.get_content()
-                soup = BeautifulSoup(content, "lxml")
-                extracted_menu_list = extract_menu_data_from_html(content)
-                print(f"🍽️ 추출된 메뉴 개수: {len(extracted_menu_list)}")
-                if extracted_menu_list:
-                    pprint.pprint(f"샘플 메뉴: {extracted_menu_list[:3]}")  # 처음 3개 메뉴 샘플 출력
+                unique_links = list(set(valid_links))
 
-                title = soup.title.string if soup.title else business_name  # 제목 없으면 가게 이름 사용
+                print(f"🍽️ 유효한 링크 개수: {len(unique_links)}")
+                print(f"🍽️ 샘플 링크: {unique_links[:3]}")
+
+                await page.get(f"https://m.place.naver.com{unique_links[0]}")
+                pprint.pprint("🔄 place_fixed_maintab 로딩 대기중...")
+                await page.wait_for(place_fixed_maintab_selector, timeout=10)
+                pprint.pprint("✅ place_fixed_maintab_selector 로딩 완료.")
+
+                parser = BeautifulSoup(await page.get_content(), "lxml")
+                main_tab = parser.select_one('div[class="place_fixed_maintab"]')
+                if main_tab:
+                    href_list = [
+                        a['href']
+                        for a in main_tab.select('a[href]')
+                        if a['href'].strip() and not a['href'].strip().startswith('#')
+                    ]
+                    print(f"🍽️ 유효한 링크 개수: {len(href_list)}")
+                    print(f"🍽️ 링크: {href_list}")
+                else:
+                    print("❌ place_fixed_maintab not found.")
+
+                place_info = extract_dynamic_place_info(parser)
+                print(place_info)
+
+                # iframe_elements_str_list = await page.select_all("#entryIframe")
+                # iframe_string = str(iframe_elements_str_list[0])
+                # match = re.search(r'src="([^"]*)"', iframe_string)
+                # pprint.pprint(f"iframe URL: {match.group(1)}")
+                # await page.get(match.group(1))
+                # content = await page.get_content()
+                # soup = BeautifulSoup(content, "lxml")
+                # extracted_menu_list = extract_menu_data_from_html(content)
+                # print(f"🍽️ 추출된 메뉴 개수: {len(extracted_menu_list)}")
+                # if extracted_menu_list:
+                #     pprint.pprint(f"샘플 메뉴: {extracted_menu_list[:3]}")  # 처음 3개 메뉴 샘플 출력
+                #
+                # title = soup.title.string if soup.title else business_name  # 제목 없으면 가게 이름 사용
+                #data = {
+                #     "title": title,
+                #     "meta_description": soup.find("meta", {"name": "description"})["content"]
+                #     if soup.find("meta", {"name": "description"}) else "No Description",
+                #     "extracted_menus": extracted_menu_list,  # 추출된 메뉴 리스트 추가
+                #     "raw_html": content  # 원본 HTML도 필요하면 유지
+                # }
+                #
+                # filename = sanitize_filename(f"{business_name}{time.time()}.json")
+                # with open(f"web_data/{filename}", "w", encoding="utf-8") as json_file:
+                #     json.dump(data, json_file, ensure_ascii=False, indent=4)
+
                 data = {
-                    "title": title,
-                    "meta_description": soup.find("meta", {"name": "description"})["content"]
-                    if soup.find("meta", {"name": "description"}) else "No Description",
-                    "extracted_menus": extracted_menu_list,  # 추출된 메뉴 리스트 추가
-                    "raw_html": content  # 원본 HTML도 필요하면 유지
+                    "title": business_name,
+                    "place_info": place_info,
+                    "tab_list": href_list,
                 }
 
                 filename = sanitize_filename(f"{business_name}{time.time()}.json")
                 with open(f"web_data/{filename}", "w", encoding="utf-8") as json_file:
                     json.dump(data, json_file, ensure_ascii=False, indent=4)
 
-
             except Exception as e:
-                print(f"❌ iframe 로딩 중 오류 발생: {e}")
+                print(f"❌ 로딩 중 오류 발생: {e}")
+                await page.save_screenshot(f"screenshots/error_{index+1}_{business_name}_{road_address}.png")
                 continue
 
         # --- 모든 루프 종료 후 ---
@@ -255,6 +348,7 @@ async def crawler():
 
     except Exception as start_err:
         print(f"💥 Zendriver 시작 또는 전체 크롤링 과정에서 심각한 오류 발생: {start_err}")
+
 
 if __name__ == "__main__":
     #store_first_db()

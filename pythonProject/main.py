@@ -205,6 +205,18 @@ def extract_dynamic_place_info(soup: BeautifulSoup):
 
     return place_info
 
+async def wait_for_selector_with_retry(page, selector, timeout=10, interval=1):
+    max_attempts = int(timeout / interval)
+    for attempt in range(max_attempts):
+        try:
+            node = await page.select_all(selector)
+            if node:
+                return node
+        except Exception:
+            pass
+        await asyncio.sleep(interval)
+    raise TimeoutError(f"❌ '{selector}' 로딩 실패 (timeout={timeout}s)")
+
 async def crawler():
     restaurant_infos = load_10_restaurant_names_and_addresses()
     if not restaurant_infos:
@@ -254,28 +266,38 @@ async def crawler():
                 page = await browser.get(mob_search_url)
                 print("🌐 페이지 이동 완료. 콘텐츠 로딩 대기 중...") # browser.get이 완료될 때까지 기다린다고 가정
 
-                await page.wait(t=3)  # 페이지 로딩 대기
                 # --- 이제 'page' (Tab 객체)를 사용하여 요소 찾기 ---
                 place_business_list_wrapper = "div.place_business_list_wrapper"
                 place_fixed_maintab_selector = "div.place_fixed_maintab"
 
                 pprint.pprint("🔄 place_business_list_wrapper 로딩 대기중...")
-                await page.wait_for(place_business_list_wrapper, timeout=10000)
-                pprint.pprint("✅ place_business_list_wrapper 로딩 완료.")
+                # 1. 리스트 페이지 대기 시도
+                try:
+                    await page.wait_for("div.place_business_list_wrapper", timeout=5)
+                    print("✅ 리스트 페이지 로딩 완료.")
 
-                tmp_content = await page.get_content()
-                tmp_parse = BeautifulSoup(tmp_content, "lxml")
-                if tmp_parse.select("div[class='FYvSc']"):
-                    pprint.pprint("❌ 검색 결과 없음.")
-                    await page.save_screenshot(f"screenshots/no_store_{index + 1}_{business_name}_{road_address}.png")
-                    continue
-                a_tags = tmp_parse.select("div.place_business_list_wrapper > ul > li a[href]")
-                href_list = [a['href'] for a in a_tags]
-                valid_links = [
-                    re.match(r"^/restaurant/\d+", href).group(0)
-                    for href in href_list
-                    if re.match(r"^/restaurant/\d+", href)
-                ]
+                    tmp_content = await page.get_content()
+                    soup = BeautifulSoup(tmp_content, "lxml")
+
+                    a_tags = soup.select("div.place_business_list_wrapper > ul > li a[href]")
+                    href_list = [a['href'] for a in a_tags]
+                    valid_links = [
+                        re.match(r"^/restaurant/\d+", href).group(0)
+                        for href in href_list if re.match(r"^/restaurant/\d+", href)
+                    ]
+                    unique_links = list(set(valid_links))
+
+                    if not unique_links:
+                        raise Exception("❌ 리스트는 있는데 링크가 없음.")
+
+                    # 리스트 페이지에서 링크로 이동
+                    target_url = f"https://m.place.naver.com{unique_links[0]}"
+                    print(f"🔁 리스트에서 첫 번째 링크로 이동: {target_url}")
+                    await page.get(target_url)
+
+                except Exception as e:
+                    print(f"⚠️ 리스트 페이지가 없거나 자동 리디렉션됨: {e}")
+                    print("📌 현재 페이지를 상세 페이지로 간주하고 처리 계속함.")
 
                 unique_links = list(set(valid_links))
 
@@ -283,8 +305,9 @@ async def crawler():
                 print(f"🍽️ 샘플 링크: {unique_links[:3]}")
 
                 await page.get(f"https://m.place.naver.com{unique_links[0]}")
+
                 pprint.pprint("🔄 place_fixed_maintab 로딩 대기중...")
-                await page.wait_for(place_fixed_maintab_selector, timeout=10)
+                await wait_for_selector_with_retry(page, place_fixed_maintab_selector, timeout=15)
                 pprint.pprint("✅ place_fixed_maintab_selector 로딩 완료.")
 
                 parser = BeautifulSoup(await page.get_content(), "lxml")

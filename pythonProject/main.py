@@ -15,13 +15,9 @@ import zendriver as zd
 import urllib
 import re
 import os
+import sys
 
-if not os.path.exists("screenshots"):
-    os.makedirs("screenshots")
-
-if not os.path.exists("web_data"):
-    os.makedirs("web_data")
-
+headless = True
 
 def store_first_db():
 
@@ -71,7 +67,7 @@ def load_10_restaurant_names_and_addresses():
     conn = sqlite3.connect('food_data.db')
     cursor = conn.cursor()
 
-    cursor.execute("SELECT 사업장명, 도로명전체주소 FROM restaurants LIMIT 50;")
+    cursor.execute("SELECT 사업장명, 도로명전체주소 FROM restaurants LIMIT 200;")
     rows = cursor.fetchall()
 
     conn.close()
@@ -96,114 +92,43 @@ def make_search_query(business_name, road_address):
     return query
 
 def sanitize_filename(name):
-    # 파일명에 사용할 수 없는 문자 제거 (\ / * ? : " < > |)
-    name = re.sub(r'[\\/*?:"<>|]', "", name)
-    # 공백을 밑줄로 변경 (선택 사항)
-    name = name.replace(" ", "_")
-    # 필요시 최대 길이 제한 (선택 사항)
-    max_len = 100
-    if len(name) > max_len:
-        name = name[:max_len]
-    return name
+    name = re.sub(r'[\\/*?:"<>|]', "", name).replace(" ", "_")
+    return name[:100] if len(name) > 100 else name
+
+async def load_page_with_wait(browser, url):
+    page = await browser.get(url)
+
+    tmp_parser = BeautifulSoup(await page.get_content(), "lxml")
+    if any(err in tmp_parser.get_text().lower() for err in [
+        "500", "internal server error", "proxy error", "nginx", "html error", "bad gateway"
+    ]):
+        time.sleep(3)
+        raise Exception("❌ 페이지 로드 실패: 서버 오류")
+    await page.wait_for("div.place_business_list_wrapper", timeout=10)
+    return page
 
 
-def extract_menu_data_from_html(html_content):
-    """
-    주어진 HTML 문자열에서 window.__APOLLO_STATE__를 찾아 메뉴 데이터를 추출합니다.
-    """
-    menu_items = []
-    processed_menu_names = set() # 간단한 메뉴 이름 기반 중복 제거용
-
-    # 정규식을 사용하여 __APOLLO_STATE__ JSON 문자열 찾기
-    # 세미콜론(;)이 뒤에 오는 패턴을 명확히 함
-    match = re.search(r'window\.__APOLLO_STATE__\s*=\s*(\{.*?\});', html_content, re.DOTALL)
-    if not match:
-        print("⚠️ 경고: HTML에서 window.__APOLLO_STATE__ 데이터를 찾지 못했습니다.")
-        return menu_items # 데이터 못 찾으면 빈 리스트 반환
-
-    apollo_state_str = match.group(1)
-
-    try:
-        # JSON 파싱
-        apollo_state = json.loads(apollo_state_str)
-    except json.JSONDecodeError as e:
-        print(f"❌ 오류: __APOLLO_STATE__ JSON 파싱 실패 - {e}")
-        # 파싱 오류 시 디버깅 정보 추가 가능
-        # error_pos = e.pos
-        # context_len = 50
-        # start = max(0, error_pos - context_len)
-        # end = min(len(apollo_state_str), error_pos + context_len)
-        # print(f"에러 발생 위치 근처: ...{apollo_state_str[start:end]}...")
-        return menu_items # 파싱 실패 시 빈 리스트 반환
-
-    # Apollo State 딕셔너리 순회하며 메뉴 정보 추출
-    for key, value in apollo_state.items():
-        # value가 딕셔너리 형태이고, __typename 키를 가지고 있는지 확인
-        if isinstance(value, dict):
-            typename = value.get("__typename")
-
-            # 메뉴 관련 타입인지 확인 (이 타입 이름들은 실제 데이터 확인 후 조정 필요)
-            if typename == "Menu" or typename == "PlaceDetail_BaeminMenu":
-                menu_name = value.get("name")
-                menu_price = value.get("price")
-                # 설명 필드는 'desc' 또는 'description'일 수 있음
-                menu_desc = value.get("desc", value.get("description", ""))
-                images = value.get("images", [])
-
-                if menu_name and menu_price is not None: # 이름과 가격이 모두 있어야 함
-                    # 가격 정리 (숫자만 추출)
-                    # 가격이 이미 숫자일 수도 있으므로 str()로 변환 후 정규식 적용
-                    cleaned_price_str = re.sub(r'[^0-9]', '', str(menu_price))
-                    cleaned_price = int(cleaned_price_str) if cleaned_price_str else None
-
-                    # 간단하게 메뉴 이름으로 중복 체크 (더 정교한 로직 가능)
-                    if menu_name not in processed_menu_names:
-                        menu_items.append({
-                            "name": menu_name,
-                            "price": cleaned_price,
-                            "description": menu_desc,
-                            "images": images
-                        })
-                        processed_menu_names.add(menu_name)
-
-    return menu_items
+async def load_page_with_wait02(browser, url):
+    page = await browser.get(url)
+    tmp_parser = BeautifulSoup(await page.get_content(), "lxml")
+    if any(err in tmp_parser.get_text().lower() for err in [
+        "500", "internal server error", "proxy error", "nginx", "html error", "bad gateway"
+    ]):
+        time.sleep(3)
+        raise Exception("❌ 페이지 로드 실패: 서버 오류")
+    await page.wait_for("div.place_fixed_maintab", timeout=10)
+    return page
 
 
-def extract_dynamic_place_info(soup: BeautifulSoup):
-    place_info = {}
+async def with_retry(func, retries=5, delay=1):
+    for attempt in range(retries):
+        try:
+            return await func()
+        except Exception as e:
+            print(f"⚠️ 재시도 {attempt+1}/{retries} 실패: {e}")
+            await asyncio.sleep(delay)
+    raise Exception("❌ 모든 재시도 실패")
 
-    info_blocks = soup.select("div.PIbes > div.O8qbU")
-
-    for block in info_blocks:
-        key_elem = block.select_one("strong > span.place_blind")
-        value_block = block.select_one("div.vV_z_")
-        if not key_elem or not value_block:
-            continue
-
-        key = key_elem.get_text(strip=True)
-
-        if key == "주소":
-            addr = value_block.select_one("span.LDgIH")
-            place_info["주소"] = addr.text.strip() if addr else None
-
-        elif key == "전화번호":
-            phone = value_block.select_one("span.xlx7Q")
-            place_info["전화번호"] = phone.text.strip() if phone else None
-
-        elif key == "영업시간":
-            status = value_block.select_one("em")
-            hours = value_block.select_one("time")
-            place_info["영업상태"] = status.text.strip() if status else None
-            place_info["영업시간"] = hours.text.strip() if hours else None
-
-        elif key == "홈페이지":
-            links = value_block.select("a.place_bluelink")
-            place_info["홈페이지들"] = [a["href"] for a in links if a.get("href")]
-
-        else:
-            place_info[key] = value_block.get_text(strip=True)
-
-    return place_info
 
 async def wait_for_selector_with_retry(page, selector, timeout=10, interval=1):
     max_attempts = int(timeout / interval)
@@ -217,15 +142,144 @@ async def wait_for_selector_with_retry(page, selector, timeout=10, interval=1):
         await asyncio.sleep(interval)
     raise TimeoutError(f"❌ '{selector}' 로딩 실패 (timeout={timeout}s)")
 
+
+def extract_dynamic_place_info(soup: BeautifulSoup):
+    place_info = {}
+    title_block = soup.select("div.zD5Nm > div#_title")
+    info_blocks = soup.select("div.PIbes > div.O8qbU")
+    if title_block:
+        title = title_block[0].get_text(strip=True)
+        place_info["title"] = title
+
+    for block in info_blocks:
+        key_elem = block.select_one("strong > span.place_blind")
+        value_block = block.select_one("div.vV_z_")
+        if not key_elem or not value_block:
+            continue
+        key = key_elem.get_text(strip=True)
+        if key == "주소":
+            addr = value_block.select_one("span.LDgIH")
+            place_info["주소"] = addr.text.strip() if addr else None
+        elif key == "전화번호":
+            phone = value_block.select_one("span.xlx7Q")
+            place_info["전화번호"] = phone.text.strip() if phone else None
+        elif key == "영업시간":
+            status = value_block.select_one("em")
+            hours = value_block.select_one("time")
+            place_info["영업상태"] = status.text.strip() if status else None
+            place_info["영업시간"] = hours.text.strip() if hours else None
+        elif key == "홈페이지":
+            links = value_block.select("a.place_bluelink")
+            place_info["홈페이지들"] = [a["href"] for a in links if a.get("href")]
+        else:
+            place_info[key] = value_block.get_text(strip=True)
+    return place_info
+
+def append_to_json_file(data, filepath):
+    # 파일이 있으면 기존 데이터 로드
+    if os.path.exists(filepath):
+        with open(filepath, "r", encoding="utf-8") as f:
+            try:
+                existing = json.load(f)
+            except json.JSONDecodeError:
+                existing = []
+    else:
+        existing = []
+
+    # 중복 방지 (title 기준)
+    titles = {entry.get("title") for entry in existing}
+    if data.get("title") not in titles:
+        existing.append(data)
+        with open(filepath, "w", encoding="utf-8") as f:
+            json.dump(existing, f, ensure_ascii=False, indent=2)
+        print(f"📦 저장 완료: {data['title']}")
+    else:
+        print(f"⚠️ 중복으로 저장 건너뜀: {data['title']}")
+
+
+def log_error_json(error_info, filepath):
+    error_info["timestamp"] = time.strftime("%Y-%m-%d %H:%M:%S")
+    with open(filepath, "a", encoding="utf-8") as f:
+        f.write(json.dumps(error_info, ensure_ascii=False) + "\n")
+    print(f"❌ 오류 기록 완료: {error_info['title'] if 'title' in error_info else '알 수 없는 오류'}")
+
+
+async def with_browser_retry(browser_ref, executable, browser_args, coro_fn, retries=5, delay=2):
+    for attempt in range(retries):
+        try:
+            result = await coro_fn(browser_ref[0])
+            html = await result.get_content()
+            soup = BeautifulSoup(html, "lxml")
+            page_text = soup.get_text().lower()
+            for err in [
+                "500", "internal server error", "proxy error", "nginx",
+                "sigkill", "sigtrap", "aw snap", "페이지를 표시하는 도중 문제"
+            ]:
+                if err in page_text:
+                    print(f"❌ 페이지 로드 실패: 에러 탐지됨 → '{err}'")
+                    raise Exception(f"🛑 HTML 내 에러 페이지 탐지됨: '{err}'")
+            return result
+        except Exception as e:
+            print(f"⚠️ 브라우저 작업 실패 {attempt+1}/{retries}: {e}")
+            try:
+                await browser_ref[0].stop()
+            except:
+                pass
+            print("🔄 브라우저 재시작 중...")
+            browser_ref = [await start_browser(executable)]
+            await asyncio.sleep(delay)
+    raise Exception("❌ 브라우저 재시도 모두 실패")
+
+
+async def start_browser(executable):
+    return await zd.start(
+        headless=headless,
+        browser_executable_path=executable,
+        browser_args=browser_args
+    )
+
+async def wait_for_browser_ready(port, timeout=10):
+    import socket
+    for _ in range(timeout):
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=1):
+                return True
+        except:
+            await asyncio.sleep(1)
+    raise Exception(f"🚫 브라우저 포트 {port} 연결 실패")
+
+
+async def with_browser_get(url, browser_ref, executable, retries=5, delay=2):
+    for attempt in range(retries):
+        try:
+            print(f"📡 시도 {attempt+1}/{retries}: {url}")
+            page = await browser_ref[0].get(url)
+            html = await page.get_content()
+            soup = BeautifulSoup(html, "lxml")
+            if any(err in soup.get_text().lower() for err in [
+                "500", "internal server error", "proxy error", "nginx", "html error", "bad gateway"
+            ]):
+                raise Exception("🛑 HTML 내 에러 페이지 탐지됨")
+            return page
+        except Exception as e:
+            print(f"⚠️ 브라우저 작업 실패 {attempt+1}/{retries}: {e}")
+            print("🔄 브라우저 재시작 중...")
+            try:
+                await browser_ref[0].stop()
+            except:
+                pass
+            browser_ref[0] = await start_browser(executable)
+            await asyncio.sleep(delay)
+    raise Exception("❌ 브라우저 재시도 모두 실패")
+
 async def crawler():
     restaurant_infos = load_10_restaurant_names_and_addresses()
+
     if not restaurant_infos:
         print("❌ 데이터베이스에서 가게 정보를 불러오지 못했습니다.")
         return
 
     print(f"ℹ️ {len(restaurant_infos)}개 가게에 대한 크롤러를 시작합니다...")
-    if not os.path.exists("screenshots"):
-        os.makedirs("screenshots")
 
     system = platform.platform()
     arch = platform.machine()
@@ -243,72 +297,80 @@ async def crawler():
             executable = "/usr/bin/chromium"
 
     try:
-        print("🚀 Zendriver 시작 중...")
-        print(f" 브라우저 실행 위치. {executable}")
-        browser = await zd.start(
-            browser_executable_path=executable,
-        )
-        print("✅ Zendriver 시작 완료. 브라우저 객체 확보.")
+        browser_ref = [await start_browser(executable)]
 
-        results = []
+        print("✅ Zendriver 시작 완료.")
+        success, fail, need_check = 0, 0, 0
 
         for index, (business_name, road_address) in enumerate(restaurant_infos):
-            search_query = make_search_query(business_name, road_address)
-            encoded_query = urllib.parse.quote(search_query) # URL 인코딩
-            search_url = f"https://map.naver.com/p/search/{encoded_query}"
-            mob_search_url = f"https://m.place.naver.com/restaurant/list?query={encoded_query}&x=126&y=37"
-
-            print(f"\n--- {index+1}/{len(restaurant_infos)} 처리 중: {search_query} ---")
-            print(f"🔗 URL: {mob_search_url}")
-
             try:
-                # 1. browser.get()으로 이동하고, 반환된 page/tab 객체를 사용
-                page = await browser.get(mob_search_url)
-                print("🌐 페이지 이동 완료. 콘텐츠 로딩 대기 중...") # browser.get이 완료될 때까지 기다린다고 가정
+                search_query = make_search_query(business_name, road_address)
+                encoded_query = urllib.parse.quote(search_query)
+                mob_url = f"https://m.place.naver.com/restaurant/list?query={encoded_query}&x=126&y=37"
+                print(f"🔗 [{index+1}] {search_query}")
+                print(f"🔗 [{index+1}] {search_query} URL: {mob_url}")
 
-                # --- 이제 'page' (Tab 객체)를 사용하여 요소 찾기 ---
-                place_business_list_wrapper = "div.place_business_list_wrapper"
-                place_fixed_maintab_selector = "div.place_fixed_maintab"
+                page = await with_browser_get(mob_url, browser_ref, executable, retries=5, delay=3)
+                await with_retry(lambda: page.wait_for("div.place_business_list_wrapper", timeout=10))
+                soup = BeautifulSoup(await page.get_content(), "lxml")
+                if soup.select("div[class='FYvSc']") or "조건에 맞는 업체가 없습니다" in soup.get_text():
+                    print(f"❌ [{index+1}] {search_query} 검색 결과 없음")
+                    await page.save_screenshot(os.path.join(SCREENSHOT_DIR, f"no_store_{sanitize_filename(business_name)}.png"))
+                    log_error_json({
+                        "query": search_query,
+                        "title": business_name,
+                        "address": road_address,
+                        "url": mob_url,
+                        "type": "no_store",
+                        "reason": "검색 결과 없음"
+                    }, os.path.join(ERROR_DIR, f"error_log_{start_index}.jsonl"))
 
-                pprint.pprint("🔄 place_business_list_wrapper 로딩 대기중...")
-                # 1. 리스트 페이지 대기 시도
-                try:
-                    await page.wait_for("div.place_business_list_wrapper", timeout=5)
-                    print("✅ 리스트 페이지 로딩 완료.")
+                    need_check += 1
+                    continue
 
-                    tmp_content = await page.get_content()
-                    soup = BeautifulSoup(tmp_content, "lxml")
+                a_tags = soup.select("div.place_business_list_wrapper > ul > li a[href]")
+                href_list = [a['href'] for a in a_tags]
+                valid_links = list(set(
+                    re.match(r"^/restaurant/\d+", href).group(0)
+                    for href in href_list if re.match(r"^/restaurant/\d+", href)
+                ))
 
-                    a_tags = soup.select("div.place_business_list_wrapper > ul > li a[href]")
-                    href_list = [a['href'] for a in a_tags]
-                    valid_links = [
-                        re.match(r"^/restaurant/\d+", href).group(0)
-                        for href in href_list if re.match(r"^/restaurant/\d+", href)
-                    ]
-                    unique_links = list(set(valid_links))
 
-                    if not unique_links:
-                        raise Exception("❌ 리스트는 있는데 링크가 없음.")
+                if not valid_links:
+                    print(f"⚠️ [{index+1}] {search_query} 링크 없음")
+                    need_check += 1
+                    continue
 
-                    # 리스트 페이지에서 링크로 이동
-                    target_url = f"https://m.place.naver.com{unique_links[0]}"
-                    print(f"🔁 리스트에서 첫 번째 링크로 이동: {target_url}")
-                    await page.get(target_url)
-
-                except Exception as e:
-                    print(f"⚠️ 리스트 페이지가 없거나 자동 리디렉션됨: {e}")
-                    print("📌 현재 페이지를 상세 페이지로 간주하고 처리 계속함.")
-
+                print(f"🔗 [{index+1}] {search_query} {len(valid_links)}개 유효 링크 발견")
+                print(f"🔗 [{index+1}] {search_query} {valid_links[:len(valid_links)]}")
                 unique_links = list(set(valid_links))
 
-                print(f"🍽️ 유효한 링크 개수: {len(unique_links)}")
-                print(f"🍽️ 샘플 링크: {unique_links[:3]}")
+                if len(unique_links) > 1:
+                    print(f"⚠️ [{index+1}] {search_query} 1차 검색 유사도 다중 상점 발견: {unique_links}")
+                    await page.save_screenshot(os.path.join(SCREENSHOT_DIR, f"multiple_stores_{sanitize_filename(business_name)}.png"))
+                    log_error_json({
+                        "query": search_query,
+                        "title": business_name,
+                        "address": road_address,
+                        "url": mob_url,
+                        "type": "multiple_stores",
+                        "reason": "유사도 높은 상점이 2개 이상 존재",
+                        "candidates": unique_links
+                    }, os.path.join(ERROR_DIR, f"error_log_{start_index}.jsonl"))
 
-                await page.get(f"https://m.place.naver.com{unique_links[0]}")
+                    need_check += 1
+                    continue
 
-                pprint.pprint("🔄 place_fixed_maintab 로딩 대기중...")
-                await wait_for_selector_with_retry(page, place_fixed_maintab_selector, timeout=15)
-                pprint.pprint("✅ place_fixed_maintab_selector 로딩 완료.")
+                #await with_retry(lambda: page.get(f"https://m.place.naver.com{valid_links[0]}"))
+
+                await with_browser_retry(
+                    browser_ref, executable, browser_args,
+                    lambda b: b.get(f"https://m.place.naver.com{valid_links[0]}")
+                )
+                print(f"🔗 [{index+1}] {search_query} {valid_links[0]} 로딩 완료")
+                print(f"🔗 [{index+1}] {search_query} 2차 URL: https://m.place.naver.com{valid_links[0]}")
+                await with_retry(lambda: page.wait_for("div.place_fixed_maintab", timeout=10))
+                #await wait_for_selector_with_retry(page, "div.place_fixed_maintab", timeout=15)
 
                 parser = BeautifulSoup(await page.get_content(), "lxml")
                 main_tab = parser.select_one('div[class="place_fixed_maintab"]')
@@ -318,61 +380,93 @@ async def crawler():
                         for a in main_tab.select('a[href]')
                         if a['href'].strip() and not a['href'].strip().startswith('#')
                     ]
-                    print(f"🍽️ 유효한 링크 개수: {len(href_list)}")
-                    print(f"🍽️ 링크: {href_list}")
+                    print(f"🍽️ [{index+1}] {search_query} 유효한 링크 개수: {len(href_list)}")
+                    print(f"🍽️ [{index+1}] {search_query} 링크: {href_list}")
                 else:
-                    print("❌ place_fixed_maintab not found.")
+                    print(f"❌ [{index+1}] {search_query} place_fixed_maintab not found.")
 
                 place_info = extract_dynamic_place_info(parser)
-                print(place_info)
-
-                # iframe_elements_str_list = await page.select_all("#entryIframe")
-                # iframe_string = str(iframe_elements_str_list[0])
-                # match = re.search(r'src="([^"]*)"', iframe_string)
-                # pprint.pprint(f"iframe URL: {match.group(1)}")
-                # await page.get(match.group(1))
-                # content = await page.get_content()
-                # soup = BeautifulSoup(content, "lxml")
-                # extracted_menu_list = extract_menu_data_from_html(content)
-                # print(f"🍽️ 추출된 메뉴 개수: {len(extracted_menu_list)}")
-                # if extracted_menu_list:
-                #     pprint.pprint(f"샘플 메뉴: {extracted_menu_list[:3]}")  # 처음 3개 메뉴 샘플 출력
-                #
-                # title = soup.title.string if soup.title else business_name  # 제목 없으면 가게 이름 사용
-                #data = {
-                #     "title": title,
-                #     "meta_description": soup.find("meta", {"name": "description"})["content"]
-                #     if soup.find("meta", {"name": "description"}) else "No Description",
-                #     "extracted_menus": extracted_menu_list,  # 추출된 메뉴 리스트 추가
-                #     "raw_html": content  # 원본 HTML도 필요하면 유지
-                # }
-                #
-                # filename = sanitize_filename(f"{business_name}{time.time()}.json")
-                # with open(f"web_data/{filename}", "w", encoding="utf-8") as json_file:
-                #     json.dump(data, json_file, ensure_ascii=False, indent=4)
 
                 data = {
+                    "query": search_query,
                     "title": business_name,
                     "place_info": place_info,
+                    "unique_links": unique_links,
                     "tab_list": href_list,
+                    "url": mob_url
                 }
 
-                filename = sanitize_filename(f"{business_name}{time.time()}.json")
-                with open(f"web_data/{filename}", "w", encoding="utf-8") as json_file:
-                    json.dump(data, json_file, ensure_ascii=False, indent=4)
+                append_to_json_file(data, output_path)
+                success += 1
+
+                if (index + 1) % 10 == 0:
+                    await page.close()
+                    await browser_ref[0].stop()
+                    print("🔄 메모리 유출 방지 브라우저 재시작 중...")
+                    browser_ref = [await start_browser(executable)]
+                    print("✅ 메모리 유출 방지 브라우저 재시작 완료.")
 
             except Exception as e:
-                print(f"❌ 로딩 중 오류 발생: {e}")
-                await page.save_screenshot(f"screenshots/error_{index+1}_{business_name}_{road_address}.png")
+                print(f"❌ 오류: {e}")
+                log_error_json({
+                    "query": search_query,
+                    "title": business_name,
+                    "address": road_address,
+                    "url": mob_url,
+                    "type": "multiple_stores",
+                    "reason": str(e),
+                    "candidates": unique_links
+                }, os.path.join(ERROR_DIR, f"error_log_{start_index}.jsonl"))
+                fail += 1
                 continue
 
-        # --- 모든 루프 종료 후 ---
-        print("\n🎉 크롤러 작업 완료.")
+        print(f"\n✅ 완료: {success} / ❌ 실패: {fail} / ⚠️ 확인 필요: {need_check}")
 
-    except Exception as start_err:
-        print(f"💥 Zendriver 시작 또는 전체 크롤링 과정에서 심각한 오류 발생: {start_err}")
+    finally:
+        await browser_ref[0].stop()
+        print("🛑 Zendriver 종료 완료")
 
 
 if __name__ == "__main__":
     #store_first_db()
+    if not os.path.exists("screenshots"):
+        os.makedirs("screenshots")
+
+    if not os.path.exists("web_data"):
+        os.makedirs("web_data")
+
+    if not os.path.exists("error_logs"):
+        os.makedirs("error_logs")
+
+    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+    SCREENSHOT_DIR = os.path.join(BASE_DIR, "screenshots")
+    DATA_DIR = os.path.join(BASE_DIR, "web_data")
+    ERROR_DIR = os.path.join(BASE_DIR, "error_logs")
+
+    os.makedirs(SCREENSHOT_DIR, exist_ok=True)
+    os.makedirs(DATA_DIR, exist_ok=True)
+    os.makedirs(ERROR_DIR, exist_ok=True)
+
+    print("📂 Screenshot 저장 경로:", SCREENSHOT_DIR)
+    print("📂 WebData 저장 경로:", DATA_DIR)
+    print("📂 ErrorLog 저장 경로:", ERROR_DIR)
+
+    start_index = int(os.environ.get("START_INDEX", sys.argv[1] if len(sys.argv) > 1 else 0))
+    output_path = os.path.join(DATA_DIR, f"output_{start_index}.json")
+
+    browser_args = [
+        "--no-sandbox",
+        "--disable-dev-shm-usage",
+        "--disable-setuid-sandbox",
+        "--disable-software-rasterizer",
+        "--disable-blink-features=AutomationControlled",
+        "--window-size=1280x800",  # 반드시 사이즈 지정
+        "--start-maximized",  # headless에서도 최대화처럼 보이게
+        "--disable-infobars",
+        "--disable-extensions",
+        "--disable-popup-blocking",
+        "--enable-logging=stderr",
+        "--log-level=1",
+    ]
+
     asyncio.run(crawler())

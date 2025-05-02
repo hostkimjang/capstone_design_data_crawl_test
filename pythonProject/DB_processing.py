@@ -2,6 +2,7 @@ import pprint
 import sqlite3
 import json
 import time
+import os
 
 
 def connect_merged_db() -> sqlite3.Connection:
@@ -135,7 +136,23 @@ def process_error_data(error_data_path):
 
 
 if __name__ == "__main__":
-    datapath = 'web_data/output_0.json'
-    error_data_path = 'error_logs/error_log_0.jsonl'
-    crawl_data_process(datapath, error_data_path)
-    process_error_data(error_data_path)
+    # web_data 디렉토리 내부 모든 .json 파일
+    web_data_dir = 'web_data'
+    web_files = sorted([
+        os.path.join(web_data_dir, f)
+        for f in os.listdir(web_data_dir)
+        if f.endswith('.json')
+    ])
+
+    # error_logs 디렉토리 내부 모든 .jsonl 파일
+    error_log_dir = 'error_logs'
+    error_files = sorted([
+        os.path.join(error_log_dir, f)
+        for f in os.listdir(error_log_dir)
+        if f.endswith('.jsonl')
+    ])
+
+    for datapath, error_data_path in zip(web_files, error_files):
+        print(f"\n📁 처리 중: {datapath} / {error_data_path}")
+        crawl_data_process(datapath, error_data_path)
+        process_error_data(error_data_path)

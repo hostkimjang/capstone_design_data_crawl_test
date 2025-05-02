@@ -17,7 +17,7 @@ import re
 import os
 import sys
 
-headless = True
+headless = False
 
 def store_first_db():
 

@@ -1,5 +1,8 @@
+import pprint
 import sqlite3
 import json
+import time
+
 
 def connect_merged_db() -> sqlite3.Connection:
     """
@@ -9,11 +12,13 @@ def connect_merged_db() -> sqlite3.Connection:
     conn.execute("ATTACH DATABASE 'food_data.db' AS orig;")  # 원본 DB attach
     return conn
 
-
 def crawl_data_json_load(datapath):
     with open(datapath, 'r', encoding='utf-8') as f:
         return json.load(f)
 
+def error_data_json_load(error_data_path):
+    with open(error_data_path, 'r', encoding='utf-8') as f:
+        return [json.loads(line.strip()) for line in f if line.strip()]
 
 def create_merged_table(cursor):
     cursor.execute("""
@@ -39,7 +44,7 @@ def create_merged_table(cursor):
     """)
 
 
-def crawl_data_process(datapath):
+def crawl_data_process(datapath, error_data_path):
     conn = connect_merged_db()
     cursor = conn.cursor()
     create_merged_table(cursor)
@@ -66,6 +71,13 @@ def crawl_data_process(datapath):
         if not result:
             print(f"[{idx}] ❌ No match for {title}")
             continue
+
+        update_sql = f"""
+        UPDATE orig.restaurants
+        SET CRAWL = 1
+        WHERE 사업장명 LIKE ? AND 도로명전체주소 LIKE ?
+        """
+        cursor.execute(update_sql, (f'{title}%', f'{road_address}%'))
 
         # 네이버 크롤링 데이터
         place = item.get("place_info", {})
@@ -97,7 +109,33 @@ def crawl_data_process(datapath):
     conn.close()
     print("✅ 병합 및 저장 완료")
 
+def process_error_data(error_data_path):
+    data = error_data_json_load(error_data_path)
+    conn = connect_merged_db()
+    cursor = conn.cursor()
+
+    updated_count = 0
+    for item in data:
+        title = item.get("title", "").strip()
+        query = item.get("query", "").strip()
+        road_address = query[len(title):].strip()
+        reason = item.get("reason", "Unknown")
+
+        update_sql = """
+        UPDATE orig.restaurants
+        SET crawl_error = 1, error_reason = ?
+        WHERE 사업장명 LIKE ? AND 도로명전체주소 LIKE ?
+        """
+        cursor.execute(update_sql, (reason, f'{title}%', f'{road_address}%'))
+        updated_count += cursor.rowcount
+
+    conn.commit()
+    conn.close()
+    print(f"✅ 오류 항목 {updated_count}건 업데이트 완료.")
+
 
 if __name__ == "__main__":
     datapath = 'web_data/output_0.json'
-    crawl_data_process(datapath)
+    error_data_path = 'error_logs/error_log_0.jsonl'
+    crawl_data_process(datapath, error_data_path)
+    process_error_data(error_data_path)

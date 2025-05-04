@@ -2,8 +2,6 @@ import asyncio
 import json
 import random
 import time
-from asyncio import wait_for
-from time import sleep
 import lxml
 import platform
 from bs4 import BeautifulSoup
@@ -14,60 +12,16 @@ import sqlite3
 import zendriver as zd
 import urllib
 import re
+from re import search, sub, compile as re_compile # compile 추가
 import os
 import sys
 
 headless = False
 
-def store_first_db():
-
-    file_path = 'fulldata_07_24_04_P_일반음식점.csv'
-
-    with open(file_path, 'rb') as f:
-        sample = f.read(1024 * 1024)  # 1MB
-
-    # 샘플 데이터로 인코딩 감지
-    encoding_data = chardet.detect(sample)
-    detected_encoding = encoding_data['encoding']
-    print(f"Detected encoding: {detected_encoding}")
-
-    data = pd.read_csv(file_path, encoding=detected_encoding, low_memory=False)
-    pprint.pprint(data.head())
-    print("Data loaded successfully.")
-
-    # for column in data.columns:
-    #     unique_values = data[column].dropna().unique()
-    #     print(f"📌 컬럼: {column}")
-    #     print(f"   ▶ 고유값 {len(unique_values)}개")
-    #     print(f"   ▶ 샘플: {unique_values[:10]}")  # 처음 10개만 보여줌
-    #     print("-" * 50)
-
-    #check data length
-    print(f"Total records: {len(data)}")
-
-    # 폐업 제외
-    if '영업상태명' in data.columns:
-        print("🛠️ '영업상태명' 컬럼을 기준으로 폐업 데이터 걸러내는 중...")
-        data = data[data['영업상태명'] != '폐업']
-    else:
-        print("⚠️ '영업상태명' 컬럼이 없습니다. 폐업 데이터 걸러내지 않습니다.")
-
-    # SQLite 데이터베이스 연결
-    conn = sqlite3.connect('food_data.db')
-
-    # DataFrame을 SQLite 테이블로 저장
-    data.to_sql('restaurants', conn, if_exists='replace', index=False)
-
-    # 연결 끊기
-    conn.close()
-
-    print(f"✅ 폐업 제외 후 {len(data)}건 저장 완료! (DB: food_data.db, Table: restaurants)")
-
 def load_10_restaurant_names_and_addresses():
-    conn = sqlite3.connect('food_data.db')
+    conn = sqlite3.connect('food_merged_final.db')
     cursor = conn.cursor()
-
-    cursor.execute("SELECT 번호, 사업장명, 도로명전체주소 FROM restaurants LIMIT 200;")
+    cursor.execute("SELECT ID, 사업장명, 네이버_PLACE_ID_URL FROM restaurant_merged  LIMIT 200;")
     rows = cursor.fetchall()
 
     conn.close()
@@ -78,6 +32,17 @@ def load_10_restaurant_names_and_addresses():
         if id and business_name and road_address:
             restaurant_infos.append((id, business_name, road_address))
     return restaurant_infos
+
+def load_restaurant_subset(start, end):
+    conn = sqlite3.connect("/app/food_merged_final.db")
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT ID, 사업장명, 네이버_PLACE_ID_URL FROM restaurant_merged LIMIT ? OFFSET ?",
+        (end - start, start),
+    )
+    rows = cursor.fetchall()
+    conn.close()
+    return [(id, name, naver_id) for id, name, naver_id in rows if name and id]
 
 def make_search_query(business_name, road_address):
     # 도로명 주소 앞 3단계까지만
@@ -268,9 +233,99 @@ async def with_browser_get(url, browser_ref, executable, retries=5, delay=2):
                 await browser_ref[0].stop()
             except:
                 pass
-            browser_ref[0] = await start_browser(executable)
             await asyncio.sleep(delay)
+            browser_ref[0] = await start_browser(executable)
     raise Exception("❌ 브라우저 재시도 모두 실패")
+
+def normalize(text: str) -> str:
+    if not text:
+        return ''
+    text = re.sub(r'\s+', '', text)                 # 모든 공백 제거
+    text = re.sub(r'[^\w가-힣]', '', text)           # 특수문자 제거
+    text = re.sub(r'[\u200b\u200c\u200d\ufeff\xa0]', '', text)  # 비가시 문자 제거
+    return text.lower()
+
+
+
+def extract_rq_items(html_text: str):
+    """
+    window.__RQ_STREAMING_STATE__.push({...}); 블록 안의 JSON을 추출해서
+    items 리스트를 전부 반환한다.
+    """
+    parser = BeautifulSoup(html_text, "lxml")
+    scripts = parser.find_all("script")
+    # pprint.pprint(scripts) # 디버깅용
+
+    # window.__RQ_STREAMING_STATE__.push(...) 를 찾는 정규식
+    # JSON 객체가 복잡하고 여러 줄일 수 있으므로 관대한 패턴 사용
+    push_regex = re_compile(
+        r'window\.__RQ_STREAMING_STATE__\.push\((.*?)\)\s*;?\s*$', # 끝부분 공백/세미콜론 허용
+        re.DOTALL | re.MULTILINE # 여러 줄에 걸쳐 매칭
+    )
+
+    all_items = []
+    found_pushes = 0
+
+    for script in scripts:
+        if not script.string:
+            continue
+
+        # 정규식으로 push 호출 부분 찾기
+        matches = push_regex.findall(script.string.strip()) # 스크립트 내용 앞뒤 공백 제거
+        # pprint.pprint(matches) # 디버깅용
+        for match in matches:
+            found_pushes += 1
+            # print(f"DEBUG: Found push content: {match[:200]}...") # 디버깅용
+            try:
+                # JSON 파싱 시도
+                parsed = json.loads(match)
+
+                # 'queries' 키 확인 및 순회
+                queries = parsed.get("queries", [])
+                if not isinstance(queries, list):
+                    # print("DEBUG: 'queries' is not a list.")
+                    continue
+
+                for q_index, q in enumerate(queries):
+                    # 'state', 'data', 'items' 경로 확인
+                    items = q.get("state", {}).get("data", {}).get("items", [])
+
+                    # items가 리스트이고 내용이 있는지 확인
+                    if isinstance(items, list) and items:
+                        print(f"✅ Script 내에서 {len(items)}개의 items 발견 (query index: {q_index})")
+                        all_items.extend(items) # 찾은 아이템 추가
+
+            except json.JSONDecodeError as e:
+                # print(f"⚠️ JSON 파싱 실패: {e}. Content: {match[:300]}...") # 디버깅용
+                continue # 파싱 실패 시 다음 매치 또는 스크립트로
+            except Exception as e:
+                print(f"⚠️ 데이터 추출 중 예상치 못한 오류: {e}")
+                continue
+
+    if found_pushes == 0:
+         print("🟡 RQ_STREAMING_STATE push 호출을 찾지 못했습니다.")
+    elif not all_items:
+        print("🟡 push 호출은 찾았으나, 유효한 'items' 데이터를 포함한 호출이 없었습니다.")
+    else:
+         print(f"✅ 최종 추출된 items: {len(all_items)}개")
+
+    return all_items
+
+def extract_menu_items_from_apollo(apollo_json):
+    menu_items = []
+
+    for key, value in apollo_json.items():
+        if key.startswith("Menu:") and isinstance(value, dict):
+            menu_data = {
+                "name": value.get("name", "").strip(),
+                "price": value.get("price", "").strip(),
+                "description": value.get("description", "").strip(),
+                "images": value.get("images", [])
+            }
+            menu_items.append(menu_data)
+
+    return menu_items
+
 
 async def crawler():
     restaurant_infos = load_10_restaurant_names_and_addresses()
@@ -302,133 +357,84 @@ async def crawler():
         print("✅ Zendriver 시작 완료.")
         success, fail, need_check = 0, 0, 0
 
-        for index, (id, business_name, road_address) in enumerate(restaurant_infos):
+        for index, (id, business_name, naver_id) in enumerate(restaurant_infos):
+            if (index + 1) % 50 == 0:
+                await page.close()
+                await browser_ref[0].stop()
+                print("🔄 메모리 유출 방지 브라우저 재시작 중...")
+                browser_ref = [await start_browser(executable)]
+                print("✅ 메모리 유출 방지 브라우저 재시작 완료.")
+
             try:
-                search_query = make_search_query(business_name, road_address)
+                #search_query = make_search_query(business_name, road_address)
+                search_query = re.sub(r'\D', '', naver_id).strip()
+
+                print(f"🔍 [{index + 1} | {len(restaurant_infos)}] 검색 쿼리: {search_query}")
                 encoded_query = urllib.parse.quote(search_query)
-                mob_url = f"https://m.place.naver.com/restaurant/list?query={encoded_query}&x=126&y=37"
-                print(f"🔗 [{index+1}] {search_query}")
-                print(f"🔗 [{index+1}] {search_query} URL: {mob_url}")
+                mob_url = f"https://m.place.naver.com/place/{encoded_query}/menu"
+                print(f"🔗 [{index + 1} | {len(restaurant_infos)}] {business_name}")
+                print(f"🔗 [{index + 1} | {len(restaurant_infos)}] {search_query} URL: {mob_url}")
 
                 page = await with_browser_get(mob_url, browser_ref, executable, retries=5, delay=3)
-                await with_retry(lambda: page.wait_for("div.place_business_list_wrapper", timeout=10))
-                soup = BeautifulSoup(await page.get_content(), "lxml")
-                if soup.select("div[class='FYvSc']") or "조건에 맞는 업체가 없습니다" in soup.get_text():
-                    print(f"❌ [{index+1}] {search_query} 검색 결과 없음")
-                    await page.save_screenshot(os.path.join(SCREENSHOT_DIR, f"no_store_{sanitize_filename(business_name)}.png"))
-                    log_error_json({
-                        "id": id,
-                        "query": search_query,
-                        "title": business_name,
-                        "address": road_address,
-                        "url": mob_url,
-                        "type": "no_store",
-                        "reason": "검색 결과 없음"
-                    }, os.path.join(ERROR_DIR, f"error_log_{start_index}.jsonl"))
+                await page.wait_for("div.place_fixed_maintab", timeout=10)
+                html_src = await page.get_content()
+                soup = BeautifulSoup(html_src, 'lxml')
 
-                    need_check += 1
-                    continue
+                scripts = soup.find_all('script')
+                apollo_data_raw = None
+                for script in scripts:
+                    # Check if the script content exists and contains the target string
+                    if script.string and "window.__APOLLO_STATE__" in script.string:
+                        # --- Corrected Regex ---
+                        # Removed the '$' anchor to match even if other JS code follows the APOLLO_STATE assignment.
+                        # Added non-greedy match {.*?} just in case of nested structures, though {.*} often works too.
+                        match = re.search(r"window\.__APOLLO_STATE__\s*=\s*({.*?});", script.string, re.DOTALL)
+                        if match:
+                            apollo_data_raw = match.group(1)
+                            print("✅ APOLLO_STATE 스크립트 블록 찾음.")
+                            break  # Exit the loop once found
 
-                a_tags = soup.select("div.place_business_list_wrapper > ul > li a[href]")
-                href_list = [a['href'] for a in a_tags]
-                valid_links = list(set(
-                    re.match(r"^/restaurant/\d+", href).group(0)
-                    for href in href_list if re.match(r"^/restaurant/\d+", href)
-                ))
+                if not apollo_data_raw:
+                    print("🟡 APOLLO_STATE 데이터를 포함하는 스크립트를 찾지 못했습니다.")
+                    return []
 
+                try:
+                    # Attempt to load the extracted string as JSON
+                    apollo_json = json.loads(apollo_data_raw)
+                    print("✅ APOLLO_STATE JSON 파싱 성공.")
+                except json.JSONDecodeError as e:
+                    print(f"❌ JSON 파싱 실패: {e}")
+                    # Optional: Print a snippet of the raw data for debugging JSON errors
+                    # print("--- 파싱 시도한 데이터 (일부) ---")
+                    # print(apollo_data_raw[:500] + "..." if apollo_data_raw else "N/A")
+                    # print("-----------------------------")
+                    return []
 
-                if not valid_links:
-                    print(f"⚠️ [{index+1}] {search_query} 링크 없음")
-                    need_check += 1
-                    continue
-
-                print(f"🔗 [{index+1}] {search_query} {len(valid_links)}개 유효 링크 발견")
-                print(f"🔗 [{index+1}] {search_query} {valid_links[:len(valid_links)]}")
-                unique_links = list(set(valid_links))
-
-                if len(unique_links) > 1:
-                    print(f"⚠️ [{index+1}] {search_query} 1차 검색 유사도 다중 상점 발견: {unique_links}")
-                    await page.save_screenshot(os.path.join(SCREENSHOT_DIR, f"multiple_stores_{sanitize_filename(business_name)}.png"))
-                    log_error_json({
-                        "id": id,
-                        "query": search_query,
-                        "title": business_name,
-                        "address": road_address,
-                        "url": mob_url,
-                        "type": "multiple_stores",
-                        "reason": "유사도 높은 상점이 2개 이상 존재",
-                        "candidates": unique_links
-                    }, os.path.join(ERROR_DIR, f"error_log_{start_index}.jsonl"))
-
-                    need_check += 1
-                    continue
-
-                #await with_retry(lambda: page.get(f"https://m.place.naver.com{valid_links[0]}"))
-
-                await with_browser_retry(
-                    browser_ref, executable, browser_args,
-                    lambda b: b.get(f"https://m.place.naver.com{valid_links[0]}")
-                )
-                print(f"🔗 [{index+1}] {search_query} {valid_links[0]} 로딩 완료")
-                print(f"🔗 [{index+1}] {search_query} 2차 URL: https://m.place.naver.com{valid_links[0]}")
-                await with_retry(lambda: page.wait_for("div.place_fixed_maintab", timeout=10))
-                #await wait_for_selector_with_retry(page, "div.place_fixed_maintab", timeout=15)
-
-                parser = BeautifulSoup(await page.get_content(), "lxml")
-                main_tab = parser.select_one('div[class="place_fixed_maintab"]')
-                if main_tab:
-                    href_list = [
-                        a['href']
-                        for a in main_tab.select('a[href]')
-                        if a['href'].strip() and not a['href'].strip().startswith('#')
-                    ]
-                    print(f"🍽️ [{index+1}] {search_query} 유효한 링크 개수: {len(href_list)}")
-                    print(f"🍽️ [{index+1}] {search_query} 링크: {href_list}")
-                else:
-                    print(f"❌ [{index+1}] {search_query} place_fixed_maintab not found.")
-
-                place_info = extract_dynamic_place_info(parser)
+                menu_items = extract_menu_items_from_apollo(apollo_json)
 
                 data = {
                     "id": id,
                     "query": search_query,
                     "title": business_name,
-                    "place_info": place_info,
-                    "unique_links": unique_links,
-                    "tab_list": href_list,
+                    "menu": menu_items,
                     "url": mob_url
                 }
+                # print(data)
 
                 append_to_json_file(data, output_path)
                 success += 1
 
-                if (index + 1) % 10 == 0:
-                    await page.close()
-                    await browser_ref[0].stop()
-                    print("🔄 메모리 유출 방지 브라우저 재시작 중...")
-                    browser_ref = [await start_browser(executable)]
-                    print("✅ 메모리 유출 방지 브라우저 재시작 완료.")
-
             except Exception as e:
-                print(f"❌ 오류: {e}")
-                log_error_json({
-                    "id": id,
-                    "query": search_query,
-                    "title": business_name,
-                    "address": road_address,
-                    "url": mob_url,
-                    "type": "multiple_stores",
-                    "reason": str(e),
-                    "candidates": unique_links
-                }, os.path.join(ERROR_DIR, f"error_log_{start_index}.jsonl"))
+                print(f"❌ [{index + 1} | {len(restaurant_infos)}] JSON 매칭 실패: {e}")
                 fail += 1
                 continue
 
-        print(f"\n✅ 완료: {success} / ❌ 실패: {fail} / ⚠️ 확인 필요: {need_check}")
 
     finally:
         await browser_ref[0].stop()
         print("🛑 Zendriver 종료 완료")
+        print("🛑 크롤러 종료 완료")
+        print(f"\n✅ 완료: {success} / ❌ 실패: {fail} / ⚠️ 확인 필요: {need_check}")
 
 
 if __name__ == "__main__":
@@ -456,7 +462,7 @@ if __name__ == "__main__":
     print("📂 ErrorLog 저장 경로:", ERROR_DIR)
 
     start_index = int(os.environ.get("START_INDEX", sys.argv[1] if len(sys.argv) > 1 else 0))
-    output_path = os.path.join(DATA_DIR, f"output_{start_index}.json")
+    output_path = os.path.join(DATA_DIR, f"crawl_menu_{start_index}.json")
 
     browser_args = [
         "--no-sandbox",
@@ -465,6 +471,7 @@ if __name__ == "__main__":
         "--disable-software-rasterizer",
         "--disable-blink-features=AutomationControlled",
         "--window-size=1280x800",  # 반드시 사이즈 지정
+        # "--start-maximized",  # headless에서도 최대화처럼 보이게
         "--disable-infobars",
         "--disable-extensions",
         "--disable-popup-blocking",

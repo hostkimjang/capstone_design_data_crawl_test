@@ -313,6 +313,34 @@ def extract_rq_items(html_text: str):
 
 def extract_menu_items_from_apollo(apollo_json):
     menu_items = []
+    coordinate = []
+
+    place_detail_base_key = None
+    for key in apollo_json.keys():
+        if key.startswith("PlaceDetailBase:"):
+            place_detail_base_key = key
+            break
+
+    if place_detail_base_key:
+        place_detail_base_data = apollo_json.get(place_detail_base_key, {})
+        coordinate_data = place_detail_base_data.get("coordinate", {})
+        if coordinate_data:
+            # Naver often uses 'y' for latitude and 'x' for longitude
+            latitude = coordinate_data.get("y")
+            longitude = coordinate_data.get("x")
+            if latitude is not None and longitude is not None:
+                coordinates = {
+                    "latitude": str(latitude).strip(), # Ensure it's a string
+                    "longitude": str(longitude).strip() # Ensure it's a string
+                }
+                print(f"✅ 좌표 정보 추출 성공: {coordinates}")
+            else:
+                print("🟡 PlaceDetailBase에 y 또는 x 좌표가 없습니다.")
+        else:
+            print("🟡 PlaceDetailBase에 coordinate 객체가 없습니다.")
+    else:
+        print("🟡 APOLLO_STATE에서 PlaceDetailBase 정보를 찾지 못해 좌표를 추출할 수 없습니다.")
+
 
     for key, value in apollo_json.items():
         if key.startswith("Menu:") and isinstance(value, dict):
@@ -324,7 +352,7 @@ def extract_menu_items_from_apollo(apollo_json):
             }
             menu_items.append(menu_data)
 
-    return menu_items
+    return menu_items, coordinates
 
 
 async def crawler():
@@ -402,6 +430,7 @@ async def crawler():
                     # Attempt to load the extracted string as JSON
                     apollo_json = json.loads(apollo_data_raw)
                     print("✅ APOLLO_STATE JSON 파싱 성공.")
+                    #pprint.pprint(apollo_json)  # Optional: Print the parsed JSON for debugging
                 except json.JSONDecodeError as e:
                     print(f"❌ JSON 파싱 실패: {e}")
                     # Optional: Print a snippet of the raw data for debugging JSON errors
@@ -410,10 +439,11 @@ async def crawler():
                     # print("-----------------------------")
                     return []
 
-                menu_items = extract_menu_items_from_apollo(apollo_json)
+                menu_items, cordinates = extract_menu_items_from_apollo(apollo_json)
 
                 data = {
                     "id": id,
+                    "cordinates": cordinates,
                     "query": search_query,
                     "title": business_name,
                     "menu": menu_items,

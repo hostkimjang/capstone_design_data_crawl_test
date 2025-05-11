@@ -313,7 +313,6 @@ def extract_rq_items(html_text: str):
 
 def extract_menu_items_from_apollo(apollo_json):
     menu_items = []
-    coordinate = []
 
     place_detail_base_key = None
     for key in apollo_json.keys():

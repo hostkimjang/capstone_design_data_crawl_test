@@ -126,7 +126,8 @@ def insert_enriched_data(json_path='web_data_enriched.json', db_path='food_merge
         네이버_URL TEXT,
         네이버_PLACE_ID_URL TEXT,
         네이버_place_info TEXT,
-        네이버_tab_list TEXT
+        네이버_tab_list TEXT,
+        MENU TEXT,
     )
     """)
 
@@ -159,8 +160,8 @@ def insert_enriched_data(json_path='web_data_enriched.json', db_path='food_merge
         최종수정시점, 데이터갱신일자, 업태구분명,
         네이버_상호명, 네이버_주소, 네이버_전화번호,
         네이버_URL, 네이버_PLACE_ID_URL,
-        네이버_place_info, 네이버_tab_list
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        네이버_place_info, 네이버_tab_list, MENU
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, records_to_insert)
     conn.commit()
     conn.close()
@@ -200,7 +201,7 @@ if __name__ == "__main__":
     start = time.time()
 
     print("📥 JSON 데이터 로드 중...")
-    all_data = load_all_json_data("./tmp/web_data")
+    all_data = load_all_json_data("./web_data")
 
     print("🧠 ID 매칭 인덱스 준비...")
     id_map = build_db_index_map()
@@ -213,9 +214,9 @@ if __name__ == "__main__":
     insert_enriched_data()
     print("✅ DB 삽입 완료")
 
-    # print("원본 DB CRAWL 값 업데이트 시작...")
-    # db_crawl_process()
-    # print("✅ 원본 DB CRAWL 값 업데이트 완료")
+    print("원본 DB CRAWL 값 업데이트 시작...")
+    db_crawl_process()
+    print("✅ 원본 DB CRAWL 값 업데이트 완료")
 
     end = time.time()
     print(f"⏰ 전체 소요 시간: {end - start:.2f}초")

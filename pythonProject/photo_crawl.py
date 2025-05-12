@@ -10,13 +10,14 @@ from datetime import datetime
 from tqdm import tqdm
 from playwright.async_api import async_playwright
 
-DB_PATH = "./food_merged_final.db"
+DB_PATH = "/app/food_merged_final.db"  # Docker 환경의 DB 경로
 TABLE_NAME = "restaurant_merged"
 BUSINESS_ID_COLUMN = "네이버_PLACE_ID_URL"
 MAX_PAGES = 10
 MAX_RETRIES = 3
-MIN_DELAY = 1
-MAX_DELAY = 3
+MIN_DELAY = 0.5  # 분산처리를 위해 딜레이 최소화
+MAX_DELAY = 2
+GRAPHQL_URL = "https://api.place.naver.com/graphql"
 
 # GraphQL 쿼리 데이터
 PHOTO_QUERY = """
@@ -145,181 +146,32 @@ def save_jsonl(filename, photos, output_path):
             f.write(json.dumps(p, ensure_ascii=False) + "\n")
 
 def load_business_ids_range(start=0, end=100):
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute(f"""
-        SELECT id, {BUSINESS_ID_COLUMN}
-        FROM {TABLE_NAME}
-        WHERE {BUSINESS_ID_COLUMN} IS NOT NULL
-        LIMIT ? OFFSET ?
-    """, (end - start, start))
-    rows = cursor.fetchall()
-    conn.close()
-    ids = []
-    for db_id, url in rows:
-        match = re.search(r'/restaurant/(\d+)', url)
-        if match:
-            business_id = match.group(1)
-            ids.append((db_id, business_id))
-    return ids
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute(f"""
+            SELECT id, {BUSINESS_ID_COLUMN}
+            FROM {TABLE_NAME}
+            WHERE {BUSINESS_ID_COLUMN} IS NOT NULL
+            LIMIT ? OFFSET ?
+        """, (end - start, start))
+        rows = cursor.fetchall()
+        conn.close()
+        ids = []
+        for db_id, url in rows:
+            match = re.search(r'/restaurant/(\d+)', url)
+            if match:
+                business_id = match.group(1)
+                ids.append((db_id, business_id))
+        return ids
+    except Exception as e:
+        print(f"❌ DB 접근 오류: {e}")
+        return []
 
 def random_delay():
     delay = random.uniform(MIN_DELAY, MAX_DELAY)
     time.sleep(delay)
     return delay
-
-async def extract_cookies_from_browser(page, business_id=None):
-    """Playwright를 사용하여 브라우저에서 쿠키를 추출하는 함수"""
-    try:
-        # 유효한 URL 설정
-        if business_id:
-            url = f"https://m.place.naver.com/restaurant/{business_id}/home"
-        else:
-            # 레스토랑 목록 페이지
-            url = "https://m.place.naver.com/restaurant/list"
-        
-        # 페이지 이동
-        await page.goto(url, wait_until="networkidle")
-        print(f"🔄 세션 초기화 중... (URL: {url})")
-        
-        # 페이지와 상호작용하여 더 많은 쿠키 생성
-        # 스크롤
-        await page.evaluate("""
-            () => {
-                window.scrollTo(0, 200);
-                setTimeout(() => window.scrollTo(0, 400), 300);
-                setTimeout(() => window.scrollTo(0, 100), 600);
-            }
-        """)
-        await asyncio.sleep(1)
-        
-        # Playwright에서 쿠키 가져오기
-        cookies = await page.context.cookies()
-        
-        # 쿠키를 딕셔너리로 변환
-        cookie_dict = {}
-        for cookie in cookies:
-            if '.naver.com' in cookie.get('domain', ''):
-                cookie_dict[cookie['name']] = cookie['value']
-        
-        print(f"🍪 Playwright로 {len(cookie_dict)}개 쿠키 추출됨")
-        
-        # 쿠키가 비어있으면 기본값 설정
-        if not cookie_dict:
-            print("⚠️ 쿠키를 가져올 수 없습니다. 기본 쿠키 사용...")
-            cookie_dict = {
-                "NNB": "XLXNYI5U5MBTA",  # 임의의 기본값
-                "PLACE_LANGUAGE": "ko"
-            }
-            
-            # 기본 쿠키 설정
-            await page.context.add_cookies([
-                {"name": "NNB", "value": "XLXNYI5U5MBTA", "domain": ".naver.com", "path": "/"},
-                {"name": "PLACE_LANGUAGE", "value": "ko", "domain": ".place.naver.com", "path": "/"}
-            ])
-        
-        # 로컬 스토리지에서 중요 정보 확인
-        local_storage = await page.evaluate("""
-            () => {
-                try {
-                    const storage = {};
-                    for (let i = 0; i < localStorage.length; i++) {
-                        const key = localStorage.key(i);
-                        storage[key] = localStorage.getItem(key);
-                    }
-                    return storage;
-                } catch (e) {
-                    console.error('로컬 스토리지 접근 오류:', e);
-                    return {};
-                }
-            }
-        """)
-        
-        if local_storage and isinstance(local_storage, dict):
-            print(f"📦 로컬 스토리지 {len(local_storage)}개 항목 확인됨")
-            # 필요한 경우 로컬 스토리지에서 중요 정보 쿠키로 복사
-            for key in ['NNB', 'NID_AUT', 'NID_SES', 'nx_ssl']:
-                if key in local_storage and key not in cookie_dict:
-                    cookie_dict[key] = local_storage[key]
-                    print(f"🔑 로컬 스토리지에서 '{key}' 쿠키로 복사")
-                    
-                    # 쿠키로 설정
-                    await page.context.add_cookies([
-                        {"name": key, "value": local_storage[key], "domain": ".naver.com", "path": "/"}
-                    ])
-        
-        # 현재 user-agent 가져오기
-        user_agent = await page.evaluate("navigator.userAgent")
-        
-        print(f"🍪 최종 획득한 쿠키 키: {', '.join(list(cookie_dict.keys())[:5])}...")
-        return {
-            'cookies': cookie_dict,
-            'user_agent': user_agent
-        }
-    except Exception as e:
-        print(f"❌ 쿠키 추출 중 오류 발생: {e}")
-        # 오류 발생 시 기본 쿠키 반환
-        return {
-            'cookies': {
-                "NNB": "XLXNYI5U5MBTA",
-                "PLACE_LANGUAGE": "ko"
-            },
-            'user_agent': "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36"
-        }
-
-async def refresh_browser_cookies(page, business_id):
-    """브라우저 쿠키를 새로고침"""
-    try:
-        url = f"https://m.place.naver.com/restaurant/{business_id}/home"
-        await page.goto(url, wait_until="networkidle")
-        print(f"🔄 브라우저 세션 갱신 중... (URL: {url})")
-        
-        # 상호작용
-        await page.evaluate("""
-            () => {
-                window.scrollTo(0, 200);
-                setTimeout(() => window.scrollTo(0, 400), 300);
-                setTimeout(() => window.scrollTo(0, 150), 600);
-            }
-        """)
-        await asyncio.sleep(1)
-        
-        # 쿠키 가져오기
-        cookies = await page.context.cookies()
-        
-        # 쿠키를 딕셔너리로 변환
-        cookie_dict = {}
-        for cookie in cookies:
-            if '.naver.com' in cookie.get('domain', ''):
-                cookie_dict[cookie['name']] = cookie['value']
-        
-        print(f"🍪 새로고침으로 {len(cookie_dict)}개 쿠키 추출됨")
-        
-        # 쿠키가 비어있으면 기본값 설정
-        if not cookie_dict:
-            print("⚠️ 갱신 중 쿠키를 가져올 수 없습니다. 기본 쿠키 사용...")
-            cookie_dict = {
-                "NNB": "XLXNYI5U5MBTA",
-                "PLACE_LANGUAGE": "ko"
-            }
-        
-        user_agent = await page.evaluate("navigator.userAgent")
-        
-        print(f"🍪 갱신된 쿠키 키: {', '.join(list(cookie_dict.keys())[:5])}...")
-        return {
-            'cookies': cookie_dict,
-            'user_agent': user_agent
-        }
-    except Exception as e:
-        print(f"❌ 쿠키 갱신 중 오류 발생: {e}")
-        # 오류 발생 시 기본 쿠키 반환
-        return {
-            'cookies': {
-                "NNB": "XLXNYI5U5MBTA",
-                "PLACE_LANGUAGE": "ko"
-            },
-            'user_agent': "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36"
-        }
 
 def make_request_with_cookies(business_id, cursors, browser_data, retry_count=0):
     """브라우저에서 획득한 쿠키를 사용하여 requests로 요청"""
@@ -343,22 +195,9 @@ def make_request_with_cookies(business_id, cursors, browser_data, retry_count=0)
             'Sec-Fetch-Site': 'same-site'
         }
         
-        # 디버깅: 요청 전 헤더와 쿠키 출력
-        print("\n🔍 디버깅 정보 - API 요청")
-        print(f"📋 요청 URL: https://api.place.naver.com/graphql")
-        print(f"📋 비즈니스 ID: {business_id}")
-        # print(f"📋 헤더 정보:")
-        # for k, v in headers.items():
-        #     print(f"   - {k}: {v}")
-        # print(f"📋 쿠키 정보 ({len(browser_data['cookies'])}개):")
-        # for k, v in browser_data['cookies'].items():
-        #     # 값이 너무 길면 일부만 표시
-        #     display_value = v[:30] + "..." if len(v) > 30 else v
-        #     print(f"   - {k}: {display_value}")
-        
         # 요청 보내기
         response = requests.post(
-            "https://api.place.naver.com/graphql",
+            GRAPHQL_URL,
             json=payload,
             headers=headers,
             cookies=browser_data['cookies'],
@@ -368,92 +207,195 @@ def make_request_with_cookies(business_id, cursors, browser_data, retry_count=0)
         # 응답 확인
         if response.status_code != 200:
             print(f"⚠️ API 응답 오류: {response.status_code}")
-            print(f"📋 응답 내용: {response.text[:200]}...")
             if retry_count < MAX_RETRIES:
-                retry_delay = random.uniform(1, 3) * (retry_count + 1)
+                retry_delay = min(2 * (retry_count + 1), 10)  # 최대 10초까지 대기
                 print(f"🔄 {retry_delay:.1f}초 후 재시도 ({retry_count + 1}/{MAX_RETRIES})...")
                 time.sleep(retry_delay)
                 return make_request_with_cookies(business_id, cursors, browser_data, retry_count + 1)
             return None
         
         data = response.json()
-        
-        # 디버깅: 응답 데이터 일부 출력
-        print(f"📋 응답 상태 코드: {response.status_code}")
-        if data and 'data' in data and 'photoViewer' in data['data']:
-            photo_count = len(data['data']['photoViewer'].get('photos', []))
-            print(f"📋 응답에서 사진 개수: {photo_count}장")
-        
         return data
         
     except Exception as e:
         print(f"❌ 요청 예외: {e}")
         if retry_count < MAX_RETRIES:
-            retry_delay = random.uniform(1, 3) * (retry_count + 1)
+            retry_delay = min(2 * (retry_count + 1), 10)
             print(f"🔄 {retry_delay:.1f}초 후 재시도 ({retry_count + 1}/{MAX_RETRIES})...")
             time.sleep(retry_delay)
             return make_request_with_cookies(business_id, cursors, browser_data, retry_count + 1)
         return None
 
+async def extract_cookies_from_browser(page, business_id=None):
+    """Playwright를 사용하여 브라우저에서 쿠키를 추출하는 함수"""
+    try:
+        # 유효한 URL 설정
+        url = f"https://m.place.naver.com/restaurant/{business_id}/home" if business_id else "https://m.place.naver.com/restaurant/list"
+        
+        # 페이지 이동
+        await page.goto(url, wait_until="networkidle", timeout=30000)
+        print(f"🔄 세션 초기화 중... (URL: {url})")
+        
+        # 페이지와 상호작용하여 더 많은 쿠키 생성
+        await page.evaluate("""
+            () => {
+                window.scrollTo(0, 200);
+                setTimeout(() => window.scrollTo(0, 400), 300);
+                setTimeout(() => window.scrollTo(0, 100), 600);
+            }
+        """)
+        await asyncio.sleep(1)
+        
+        # Playwright에서 쿠키 가져오기
+        cookies = await page.context.cookies()
+        
+        # 쿠키를 딕셔너리로 변환
+        cookie_dict = {}
+        for cookie in cookies:
+            if '.naver.com' in cookie.get('domain', ''):
+                cookie_dict[cookie['name']] = cookie['value']
+        
+        # 쿠키가 비어있으면 기본값 설정
+        if not cookie_dict:
+            print("⚠️ 쿠키를 가져올 수 없습니다. 기본 쿠키 사용...")
+            cookie_dict = {
+                "NNB": "XLXNYI5U5MBTA",
+                "PLACE_LANGUAGE": "ko"
+            }
+            
+            # 기본 쿠키 설정
+            await page.context.add_cookies([
+                {"name": "NNB", "value": "XLXNYI5U5MBTA", "domain": ".naver.com", "path": "/"},
+                {"name": "PLACE_LANGUAGE", "value": "ko", "domain": ".place.naver.com", "path": "/"}
+            ])
+        
+        # 현재 user-agent 가져오기
+        user_agent = await page.evaluate("navigator.userAgent")
+        
+        return {
+            'cookies': cookie_dict,
+            'user_agent': user_agent
+        }
+    except Exception as e:
+        print(f"❌ 쿠키 추출 중 오류 발생: {e}")
+        # 오류 발생 시 기본 쿠키 반환
+        return {
+            'cookies': {
+                "NNB": "XLXNYI5U5MBTA",
+                "PLACE_LANGUAGE": "ko"
+            },
+            'user_agent': "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36"
+        }
+
+async def refresh_browser_cookies(page, business_id):
+    """브라우저 쿠키를 새로고침"""
+    try:
+        url = f"https://m.place.naver.com/restaurant/{business_id}/home"
+        await page.goto(url, wait_until="networkidle", timeout=30000)
+        print(f"🔄 브라우저 세션 갱신 중... (URL: {url})")
+        
+        # 상호작용
+        await page.evaluate("""
+            () => {
+                window.scrollTo(0, 200);
+                setTimeout(() => window.scrollTo(0, 400), 300);
+                setTimeout(() => window.scrollTo(0, 150), 600);
+            }
+        """)
+        await asyncio.sleep(1)
+        
+        # 쿠키 가져오기
+        cookies = await page.context.cookies()
+        
+        # 쿠키를 딕셔너리로 변환
+        cookie_dict = {}
+        for cookie in cookies:
+            if '.naver.com' in cookie.get('domain', ''):
+                cookie_dict[cookie['name']] = cookie['value']
+        
+        # 쿠키가 비어있으면 기본값 설정
+        if not cookie_dict:
+            print("⚠️ 갱신 중 쿠키를 가져올 수 없습니다. 기본 쿠키 사용...")
+            cookie_dict = {
+                "NNB": "XLXNYI5U5MBTA",
+                "PLACE_LANGUAGE": "ko"
+            }
+        
+        user_agent = await page.evaluate("navigator.userAgent")
+        
+        return {
+            'cookies': cookie_dict,
+            'user_agent': user_agent
+        }
+    except Exception as e:
+        print(f"❌ 쿠키 갱신 중 오류 발생: {e}")
+        # 오류 발생 시 기본 쿠키 반환
+        return {
+            'cookies': {
+                "NNB": "XLXNYI5U5MBTA",
+                "PLACE_LANGUAGE": "ko"
+            },
+            'user_agent': "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36"
+        }
+
 async def main():
+    # 환경 변수에서 범위 가져오기 (Docker 환경)
     start = int(os.environ.get("START_INDEX", 0))
     end = int(os.environ.get("END_INDEX", 100))
     print(f"📦 현재 컨테이너는 {start} ~ {end} 범위를 담당합니다.")
 
-    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-    output_path = os.path.join(BASE_DIR, "crawl_photo")
-    os.makedirs(output_path, exist_ok=True)
-
+    # 비즈니스 ID 로딩
     business_ids = load_business_ids_range(start, end)
     if not business_ids:
         print("⚠️ 가져올 업체 ID가 없습니다. 종료합니다.")
         return
+    
+    total = len(business_ids)
+    print(f"🔢 총 {total}개 업체를 처리합니다.")
 
-    # Playwright 초기화
+    # 출력 디렉토리 설정
+    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+    output_path = os.path.join(BASE_DIR, "crawl_photo")
+    os.makedirs(output_path, exist_ok=True)
+
+    # 결과 카운터 초기화
+    success_count = 0
+    skip_count = 0
+    error_count = 0
+    cookie_refresh_count = 0
+
+    # Playwright 초기화 - Docker에서 실행 시 headless 모드 필수
     print("🌐 Playwright 초기화 중...")
     async with async_playwright() as p:
-        # 브라우저 시작 - 헤드리스 모드 해제 (브라우저 화면 표시)
-        browser = await p.chromium.launch(headless=False)
+        # 브라우저 시작 (Docker 환경에서는 headless=True 필수)
+        browser = await p.chromium.launch(headless=True)
+        
+        # 컨텍스트 생성
         context = await browser.new_context(
             viewport={"width": 1280, "height": 800},
             user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36"
         )
         
-        # 브라우저 창 검사를 위한 대기시간
-        print("⚠️ 브라우저가 표시됩니다. 수동으로 로그인하려면 지금 로그인하세요.")
-        print("⏱️ 10초 후에 자동 크롤링이 시작됩니다...")
-        await asyncio.sleep(10)  # 사용자가 브라우저를 확인하고 필요시 수동 로그인할 시간
-        
         # 첫 페이지 생성
         page = await context.new_page()
         
         # 첫 번째 업체 정보로 초기 쿠키 획득
-        first_db_id, first_business_id = business_ids[0]
-        print(f"🔑 첫 번째 업체({first_business_id})로 초기 쿠키 획득 중...")
-        browser_data = await extract_cookies_from_browser(page, first_business_id)
-        
-        # 디버깅: 획득한 모든 쿠키 상세 출력
-        print("\n🔍 디버깅 정보 - 획득한 쿠키")
-        print(f"📋 쿠키 개수: {len(browser_data['cookies'])}")
-        print(f"📋 상세 쿠키 목록:")
-        for k, v in browser_data['cookies'].items():
-            # 값이 너무 길면 일부만 표시
-            display_value = v[:30] + "..." if len(v) > 30 else v
-            print(f"   - {k}: {display_value}")
-        print(f"📋 User-Agent: {browser_data['user_agent']}")
-        
-        print(f"📝 쿠키 획득 완료: {len(browser_data['cookies'])} 개의 쿠키")
+        if business_ids:
+            first_db_id, first_business_id = business_ids[0]
+            print(f"🔑 첫 번째 업체({first_business_id})로 초기 쿠키 획득 중...")
+            browser_data = await extract_cookies_from_browser(page, first_business_id)
+            print(f"📝 쿠키 획득 완료: {len(browser_data['cookies'])} 개의 쿠키")
+        else:
+            print("⚠️ 업체 ID가 없어 기본 쿠키를 사용합니다.")
+            browser_data = {
+                'cookies': {
+                    "NNB": "XLXNYI5U5MBTA",
+                    "PLACE_LANGUAGE": "ko"
+                },
+                'user_agent': "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36"
+            }
 
-        # 계속 진행할지 확인
-        print("\n⚠️ 획득한 쿠키로 크롤링을 시작합니다.")
-        print("⏱️ 5초 후에 자동 크롤링이 시작됩니다...")
-        await asyncio.sleep(5)  # 사용자가 쿠키 정보를 확인할 시간
-        
-        success_count = 0
-        skip_count = 0
-        error_count = 0
-        cookie_refresh_count = 0
-
+        # 각 업체에 대해 크롤링 수행
         for i, (db_id, business_id) in enumerate(tqdm(business_ids, desc="📦 범위 내 업체 처리")):
             try:
                 print(f"\n🚀 크롤링 시작: {business_id} (DB ID={db_id})")
@@ -463,19 +405,12 @@ async def main():
                     print("🔄 브라우저 쿠키 리프레시 중...")
                     browser_data = await refresh_browser_cookies(page, business_id)
                     cookie_refresh_count += 1
-                    
-                    # 디버깅: 리프레시된 모든 쿠키 상세 출력
-                    print("\n🔍 디버깅 정보 - 리프레시된 쿠키")
-                    print(f"📋 쿠키 개수: {len(browser_data['cookies'])}")
-                    print(f"📋 상세 쿠키 목록:")
-                    for k, v in browser_data['cookies'].items():
-                        # 값이 너무 길면 일부만 표시
-                        display_value = v[:30] + "..." if len(v) > 30 else v
-                        print(f"   - {k}: {display_value}")
-                    
                     print(f"📝 쿠키 리프레시 완료 (#{cookie_refresh_count})")
                 
+                # 모든 사진을 저장할 리스트
                 all_photos = []
+                
+                # 시작 커서 설정
                 cursors = [
                     {"id": "biz"},
                     {"id": "cp0"},
@@ -484,14 +419,16 @@ async def main():
                     {"id": "imgSas"}
                 ]
 
+                # 페이지별로 사진 가져오기
                 for page_num in range(MAX_PAGES):
                     print(f"📄 페이지 {page_num + 1} 요청 중...")
                     
                     # requests로 요청 (브라우저 쿠키 사용)
                     data = make_request_with_cookies(business_id, cursors, browser_data)
                     
+                    # 요청 실패 시 쿠키 갱신 후 재시도
                     if not data:
-                        print(f"⚠️ fetch() 실패 or 응답 없음 → 브라우저 쿠키 갱신 후 재시도")
+                        print(f"⚠️ 요청 실패 → 브라우저 쿠키 갱신 후 재시도")
                         browser_data = await refresh_browser_cookies(page, business_id)
                         cookie_refresh_count += 1
                         
@@ -502,14 +439,17 @@ async def main():
                             skip_count += 1
                             break
 
+                    # 응답에서 사진 정보 추출
                     viewer = data.get('data', {}).get('photoViewer', {})
                     photos = viewer.get('photos') or []
                     cursors_data = viewer.get('cursors', [])
 
+                    # 사진이 없으면 종료
                     if not photos:
                         print(f"⚠️ 사진 없음, 종료")
                         break
 
+                    # 각 사진 정보 저장
                     for photo in photos:
                         author = photo.get("author") or {}
                         all_photos.append({
@@ -523,19 +463,25 @@ async def main():
                             "viewId": photo.get("viewId")
                         })
 
+                    # 다음 페이지 커서 확인
                     next_cursor = None
                     for cursor in cursors_data:
                         if cursor["id"] == "biz" and cursor.get("hasNext") and cursor.get("lastCursor"):
                             next_cursor = cursor["lastCursor"]
+                    
+                    # 다음 페이지가 없으면 종료
                     if not next_cursor:
                         print(f"✅ 다음 커서 없음, 종료")
                         break
+                        
+                    # 다음 페이지 커서 설정
                     cursors[0] = {"id": "biz", "lastCursor": next_cursor}
                     
-                    # 페이지 간 딜레이 랜덤화
+                    # 페이지 간 딜레이
                     delay = random_delay()
                     print(f"⏱️ 다음 페이지 요청까지 {delay:.1f}초 대기 중...")
 
+                # 사진 저장
                 if all_photos:
                     filename = f"{db_id}_photo_{business_id}.jsonl"
                     save_jsonl(filename, all_photos, output_path)
@@ -545,9 +491,9 @@ async def main():
                     print(f"⚠️ 수집된 사진 없음")
                     skip_count += 1
                     
-                # 업체 간 딜레이 랜덤화
+                # 업체 간 딜레이
                 if db_id != business_ids[-1][0]:  # 마지막 업체가 아니면
-                    delay = random.uniform(0, 1)
+                    delay = random.uniform(1, 3)
                     print(f"⏱️ 다음 업체 크롤링까지 {delay:.1f}초 대기 중...")
                     time.sleep(delay)
 
@@ -556,17 +502,19 @@ async def main():
                 log_failure(business_id, {}, error=str(e))
                 error_count += 1
                 # 에러 후 복구 시간
-                time.sleep(random.uniform(5, 10))
+                time.sleep(random.uniform(3, 5))
                 continue
 
-        print("\n📊 크롤링 요약")
-        print(f"✅ 성공: {success_count}")
-        print(f"⚠️ 스킵: {skip_count}")
-        print(f"❌ 실패: {error_count}")
-        print(f"🔄 쿠키 리프레시: {cookie_refresh_count}회")
-        
         # 브라우저 종료
         await browser.close()
+
+    # 결과 요약
+    print("\n📊 크롤링 요약")
+    print(f"🔢 전체 업체 수: {total}")
+    print(f"✅ 성공: {success_count}")
+    print(f"⚠️ 스킵: {skip_count}")
+    print(f"❌ 실패: {error_count}")
+    print(f"🔄 쿠키 리프레시: {cookie_refresh_count}회")
 
 if __name__ == "__main__":
     asyncio.run(main())

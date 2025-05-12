@@ -5,148 +5,30 @@ import random
 import re
 import sqlite3
 import time
-import requests
 from datetime import datetime
 from tqdm import tqdm
 from playwright.async_api import async_playwright
 
-DB_PATH = "/app/food_merged_final.db"  # Docker 환경의 DB 경로
+DB_PATH = "food_merged_final.db"
 TABLE_NAME = "restaurant_merged"
 BUSINESS_ID_COLUMN = "네이버_PLACE_ID_URL"
-MAX_PAGES = 10
-MAX_RETRIES = 3
-MIN_DELAY = 0.5  # 분산처리를 위해 딜레이 최소화
-MAX_DELAY = 2
-GRAPHQL_URL = "https://api.place.naver.com/graphql"
+MAX_SCROLL = 10
+MIN_DELAY = 1.5
+MAX_DELAY = 3
 
-# GraphQL 쿼리 데이터
-PHOTO_QUERY = """
-query getPhotoViewerItems($input: PhotoViewerInput) {
-  photoViewer(input: $input) {
-    cursors {
-      id
-      startIndex
-      hasNext
-      lastCursor
-      __typename
-    }
-    photos {
-      viewId
-      originalUrl
-      originalDate
-      width
-      height
-      title
-      text
-      desc
-      link
-      date
-      photoType
-      mediaType
-      option {
-        channelName
-        dateString
-        playCount
-        likeCount
-        __typename
-      }
-      to
-      relation
-      logId
-      author {
-        id
-        nickname
-        from
-        imageUrl
-        objectId
-        url
-        borderImageUrl
-        __typename
-      }
-      votedKeywords {
-        code
-        iconUrl
-        iconCode
-        name
-        __typename
-      }
-      visitCount
-      originType
-      isFollowing
-      businessName
-      rating
-      externalLink {
-        title
-        url
-        __typename
-      }
-      sourceTitle
-      moment {
-        channelId
-        contentId
-        momentId
-        gdid
-        blogRelation
-        statAllowYn
-        category
-        docNo
-        __typename
-      }
-      video {
-        videoId
-        videoUrl
-        trailerUrl
-        __typename
-      }
-      music {
-        artists
-        title
-        __typename
-      }
-      clip {
-        serviceType
-        createdAt
-        __typename
-      }
-      __typename
-    }
-    __typename
-  }
-}
-"""
+PHOTO_QUERY_KEY = "photoViewer"
 
-def log_failure(business_id, payload, error=None):
+
+def log_failure(business_id, error=None):
     with open("failed_requests.log", "a", encoding="utf-8") as f:
         f.write(f"[{datetime.now()}] ❌ {business_id} 요청 실패\n")
         if error:
-            f.write(f"Error: {error}\n")
-        f.write(f"Payload: {json.dumps(payload, ensure_ascii=False)}\n\n")
+            f.write(f"Error: {error}\n\n")
 
-def make_payload(business_id, cursors):
-    return {
-        "operationName": "getPhotoViewerItems",
-        "variables": {
-            "input": {
-                "businessId": business_id,
-                "businessType": "restaurant",
-                "cursors": cursors,
-                "excludeAuthorIds": [],
-                "excludeSection": [],
-                "excludeClipIds": [],
-                "dateRange": ""
-            }
-        },
-        "query": PHOTO_QUERY
-    }
-
-def save_jsonl(filename, photos, output_path):
-    filepath = os.path.join(output_path, filename)
-    with open(filepath, "w", encoding="utf-8") as f:
-        for p in photos:
-            f.write(json.dumps(p, ensure_ascii=False) + "\n")
 
 def load_business_ids_range(start=0, end=100):
     try:
+        import sqlite3
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
         cursor.execute(f"""
@@ -168,353 +50,230 @@ def load_business_ids_range(start=0, end=100):
         print(f"❌ DB 접근 오류: {e}")
         return []
 
+
+def save_jsonl(filename, items, output_path):
+    filepath = os.path.join(output_path, filename)
+    with open(filepath, "w", encoding="utf-8") as f:
+        for p in items:
+            f.write(json.dumps(p, ensure_ascii=False) + "\n")
+
+
 def random_delay():
     delay = random.uniform(MIN_DELAY, MAX_DELAY)
     time.sleep(delay)
     return delay
 
-def make_request_with_cookies(business_id, cursors, browser_data, retry_count=0):
-    """브라우저에서 획득한 쿠키를 사용하여 requests로 요청"""
-    try:
-        payload = make_payload(business_id, cursors)
-        
-        # 헤더 설정
-        headers = {
-            'Content-Type': 'application/json',
-            'User-Agent': browser_data['user_agent'],
-            'Referer': f'https://m.place.naver.com/restaurant/{business_id}/photo',
-            'Origin': 'https://m.place.naver.com',
-            'Accept-Language': 'ko-KR,ko;q=0.9',
-            'Cache-Control': 'no-cache',
-            'Pragma': 'no-cache',
-            'Sec-Ch-Ua': '"Chromium";v="136", "Google Chrome";v="136", "Not.A/Brand";v="99"',
-            'Sec-Ch-Ua-Mobile': '?0',
-            'Sec-Ch-Ua-Platform': '"macOS"',
-            'Sec-Fetch-Dest': 'empty',
-            'Sec-Fetch-Mode': 'cors',
-            'Sec-Fetch-Site': 'same-site'
-        }
-        
-        # 요청 보내기
-        response = requests.post(
-            GRAPHQL_URL,
-            json=payload,
-            headers=headers,
-            cookies=browser_data['cookies'],
-            timeout=10
-        )
-        
-        # 응답 확인
-        if response.status_code != 200:
-            print(f"⚠️ API 응답 오류: {response.status_code}")
-            if retry_count < MAX_RETRIES:
-                retry_delay = min(2 * (retry_count + 1), 10)  # 최대 10초까지 대기
-                print(f"🔄 {retry_delay:.1f}초 후 재시도 ({retry_count + 1}/{MAX_RETRIES})...")
-                time.sleep(retry_delay)
-                return make_request_with_cookies(business_id, cursors, browser_data, retry_count + 1)
-            return None
-        
-        data = response.json()
-        return data
-        
-    except Exception as e:
-        print(f"❌ 요청 예외: {e}")
-        if retry_count < MAX_RETRIES:
-            retry_delay = min(2 * (retry_count + 1), 10)
-            print(f"🔄 {retry_delay:.1f}초 후 재시도 ({retry_count + 1}/{MAX_RETRIES})...")
-            time.sleep(retry_delay)
-            return make_request_with_cookies(business_id, cursors, browser_data, retry_count + 1)
-        return None
 
-async def extract_cookies_from_browser(page, business_id=None):
-    """Playwright를 사용하여 브라우저에서 쿠키를 추출하는 함수"""
-    try:
-        # 유효한 URL 설정
-        url = f"https://m.place.naver.com/restaurant/{business_id}/home" if business_id else "https://m.place.naver.com/restaurant/list"
-        
-        # 페이지 이동
-        await page.goto(url, wait_until="networkidle", timeout=30000)
-        print(f"🔄 세션 초기화 중... (URL: {url})")
-        
-        # 페이지와 상호작용하여 더 많은 쿠키 생성
-        await page.evaluate("""
-            () => {
-                window.scrollTo(0, 200);
-                setTimeout(() => window.scrollTo(0, 400), 300);
-                setTimeout(() => window.scrollTo(0, 100), 600);
-            }
-        """)
-        await asyncio.sleep(1)
-        
-        # Playwright에서 쿠키 가져오기
-        cookies = await page.context.cookies()
-        
-        # 쿠키를 딕셔너리로 변환
-        cookie_dict = {}
-        for cookie in cookies:
-            if '.naver.com' in cookie.get('domain', ''):
-                cookie_dict[cookie['name']] = cookie['value']
-        
-        # 쿠키가 비어있으면 기본값 설정
-        if not cookie_dict:
-            print("⚠️ 쿠키를 가져올 수 없습니다. 기본 쿠키 사용...")
-            cookie_dict = {
-                "NNB": "XLXNYI5U5MBTA",
-                "PLACE_LANGUAGE": "ko"
-            }
-            
-            # 기본 쿠키 설정
-            await page.context.add_cookies([
-                {"name": "NNB", "value": "XLXNYI5U5MBTA", "domain": ".naver.com", "path": "/"},
-                {"name": "PLACE_LANGUAGE", "value": "ko", "domain": ".place.naver.com", "path": "/"}
-            ])
-        
-        # 현재 user-agent 가져오기
-        user_agent = await page.evaluate("navigator.userAgent")
-        
-        return {
-            'cookies': cookie_dict,
-            'user_agent': user_agent
-        }
-    except Exception as e:
-        print(f"❌ 쿠키 추출 중 오류 발생: {e}")
-        # 오류 발생 시 기본 쿠키 반환
-        return {
-            'cookies': {
-                "NNB": "XLXNYI5U5MBTA",
-                "PLACE_LANGUAGE": "ko"
-            },
-            'user_agent': "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36"
-        }
+async def intercept_and_save_graphql(page, business_id, output_path):
+    """photoViewer GraphQL 응답을 가로채서 사진 정보만 저장 (이벤트 핸들러 내에서 즉시 처리)"""
+    photo_items = []
+    seen_view_ids = set()
+    protocol_error_count = 0
 
-async def refresh_browser_cookies(page, business_id):
-    """브라우저 쿠키를 새로고침"""
-    try:
-        url = f"https://m.place.naver.com/restaurant/{business_id}/home"
-        await page.goto(url, wait_until="networkidle", timeout=30000)
-        print(f"🔄 브라우저 세션 갱신 중... (URL: {url})")
-        
-        # 상호작용
-        await page.evaluate("""
-            () => {
-                window.scrollTo(0, 200);
-                setTimeout(() => window.scrollTo(0, 400), 300);
-                setTimeout(() => window.scrollTo(0, 150), 600);
-            }
-        """)
-        await asyncio.sleep(1)
-        
-        # 쿠키 가져오기
-        cookies = await page.context.cookies()
-        
-        # 쿠키를 딕셔너리로 변환
-        cookie_dict = {}
-        for cookie in cookies:
-            if '.naver.com' in cookie.get('domain', ''):
-                cookie_dict[cookie['name']] = cookie['value']
-        
-        # 쿠키가 비어있으면 기본값 설정
-        if not cookie_dict:
-            print("⚠️ 갱신 중 쿠키를 가져올 수 없습니다. 기본 쿠키 사용...")
-            cookie_dict = {
-                "NNB": "XLXNYI5U5MBTA",
-                "PLACE_LANGUAGE": "ko"
-            }
-        
-        user_agent = await page.evaluate("navigator.userAgent")
-        
-        return {
-            'cookies': cookie_dict,
-            'user_agent': user_agent
-        }
-    except Exception as e:
-        print(f"❌ 쿠키 갱신 중 오류 발생: {e}")
-        # 오류 발생 시 기본 쿠키 반환
-        return {
-            'cookies': {
-                "NNB": "XLXNYI5U5MBTA",
-                "PLACE_LANGUAGE": "ko"
-            },
-            'user_agent': "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36"
-        }
+    async def handle_response(response):
+        nonlocal protocol_error_count
+        try:
+            if 'graphql' in response.url and response.request.method == 'POST':
+                try:
+                    text = await response.text()
+                except Exception as e:
+                    protocol_error_count += 1
+                    print(f"파싱 실패(즉시): {e}")
+                    return
+                try:
+                    data = json.loads(text)
+                except Exception:
+                    # 여러 JSON 오브젝트가 콤마로 이어진 경우(비표준 JSONL)
+                    try:
+                        data = [json.loads(line) for line in text.splitlines() if line.strip()]
+                    except Exception as e:
+                        print(f"JSON 파싱 실패: {e}")
+                        return
+                if isinstance(data, list):
+                    datas = data
+                else:
+                    datas = [data]
+                photo_found = False
+                for d in datas:
+                    viewer = d.get('data', {}).get(PHOTO_QUERY_KEY, {})
+                    if isinstance(viewer, list):
+                        viewers = viewer
+                    else:
+                        viewers = [viewer]
+                    for v in viewers:
+                        photos = v.get('photos', [])
+                        if photos:
+                            photo_found = True
+                            for photo in photos:
+                                if not isinstance(photo, dict):
+                                    continue
+                                view_id = photo.get("viewId")
+                                if view_id and view_id not in seen_view_ids:
+                                    seen_view_ids.add(view_id)
+                                    author = photo.get("author") or {}
+                                    photo_items.append({
+                                        "url": photo.get("originalUrl"),
+                                        "desc": photo.get("desc"),
+                                        "author": author.get("nickname"),
+                                        "video": photo.get("video"),
+                                        "width": photo.get("width"),
+                                        "height": photo.get("height"),
+                                        "date": photo.get("date"),
+                                        "viewId": view_id
+                                    })
+                if not photo_found:
+                    print(f"⚠️ 수집된 사진 없음")
+        except Exception as e:
+            print(f"파싱 실패(핸들러): {e}")
+
+    page.on('response', handle_response)
+    # 스크롤 및 네트워크 응답 대기
+    await asyncio.sleep(0.5)  # 첫 로딩 대기
+    return photo_items
+
+
+async def debug_graphql_network(page, business_id):
+    async def on_request(request):
+        if "graphql" in request.url:
+            print(f"[REQUEST] {request.method} {request.url}")
+            # print(f"Headers: {request.headers}")
+            try:
+                post_data = await request.post_data()
+                print(f"Post Data: {post_data}")
+            except Exception:
+                pass
+
+    async def on_response(response):
+        if "graphql" in response.url:
+            print(f"[RESPONSE] {response.status} {response.url}")
+            # try:
+            #     json_data = await response.json()
+            #     print(f"Response JSON keys: {list(json_data.keys())}")
+            # except Exception:
+            #     print("응답이 JSON이 아님")
+            #     try:
+            #         text = await response.text()
+            #         print(f"응답 본문 일부: {text[:300]}")
+            #     except Exception as e:
+            #         print(f"본문 출력 실패: {e}")
+
+    page.on("request", on_request)
+    page.on("response", on_response)
+
+    url = f"https://m.place.naver.com/restaurant/{business_id}/photo"
+    await page.goto(url, wait_until="networkidle")
+    await asyncio.sleep(1)  # 네트워크 요청 충분히 기다림
+
+
+async def block_images(context):
+    async def handle_route(route, request):
+        if request.resource_type == "image":
+            await route.abort()
+        else:
+            await route.continue_()
+    await context.route("**/*", handle_route)
+
 
 async def main():
-    # 환경 변수에서 범위 가져오기 (Docker 환경)
     start = int(os.environ.get("START_INDEX", 0))
     end = int(os.environ.get("END_INDEX", 100))
     print(f"📦 현재 컨테이너는 {start} ~ {end} 범위를 담당합니다.")
 
-    # 비즈니스 ID 로딩
     business_ids = load_business_ids_range(start, end)
     if not business_ids:
         print("⚠️ 가져올 업체 ID가 없습니다. 종료합니다.")
         return
-    
+
     total = len(business_ids)
     print(f"🔢 총 {total}개 업체를 처리합니다.")
 
-    # 출력 디렉토리 설정
     BASE_DIR = os.path.dirname(os.path.abspath(__file__))
     output_path = os.path.join(BASE_DIR, "crawl_photo")
     os.makedirs(output_path, exist_ok=True)
 
-    # 결과 카운터 초기화
     success_count = 0
     skip_count = 0
     error_count = 0
-    cookie_refresh_count = 0
 
-    # Playwright 초기화 - Docker에서 실행 시 headless 모드 필수
+    BROWSER_RESTART_INTERVAL = 50
     print("🌐 Playwright 초기화 중...")
     async with async_playwright() as p:
-        # 브라우저 시작 (Docker 환경에서는 headless=True 필수)
-        browser = await p.chromium.launch(headless=True)
-        
-        # 컨텍스트 생성
+        browser = await p.chromium.launch(headless=False)
         context = await browser.new_context(
             viewport={"width": 1280, "height": 800},
-            user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36"
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36"
         )
-        
-        # 첫 페이지 생성
+        await block_images(context)
         page = await context.new_page()
-        
-        # 첫 번째 업체 정보로 초기 쿠키 획득
+
+        # 첫 업체에 대해 네트워크 graphql 감지 디버깅
         if business_ids:
             first_db_id, first_business_id = business_ids[0]
-            print(f"🔑 첫 번째 업체({first_business_id})로 초기 쿠키 획득 중...")
-            browser_data = await extract_cookies_from_browser(page, first_business_id)
-            print(f"📝 쿠키 획득 완료: {len(browser_data['cookies'])} 개의 쿠키")
-        else:
-            print("⚠️ 업체 ID가 없어 기본 쿠키를 사용합니다.")
-            browser_data = {
-                'cookies': {
-                    "NNB": "XLXNYI5U5MBTA",
-                    "PLACE_LANGUAGE": "ko"
-                },
-                'user_agent': "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36"
-            }
+            print(f"🔎 첫 업체({first_business_id}) 네트워크 graphql 감지 테스트...")
+            await debug_graphql_network(page, first_business_id)
+            print("✅ 네트워크 감지 테스트 종료. 이후 코드 진행하려면 debug_graphql_network 호출을 주석 처리하세요.")
 
-        # 각 업체에 대해 크롤링 수행
         for i, (db_id, business_id) in enumerate(tqdm(business_ids, desc="📦 범위 내 업체 처리")):
             try:
                 print(f"\n🚀 크롤링 시작: {business_id} (DB ID={db_id})")
-                
-                # 주기적으로 쿠키 리프레시 (10개 업체마다)
-                if i > 0 and i % 10 == 0:
-                    print("🔄 브라우저 쿠키 리프레시 중...")
-                    browser_data = await refresh_browser_cookies(page, business_id)
-                    cookie_refresh_count += 1
-                    print(f"📝 쿠키 리프레시 완료 (#{cookie_refresh_count})")
-                
-                # 모든 사진을 저장할 리스트
-                all_photos = []
-                
-                # 시작 커서 설정
-                cursors = [
-                    {"id": "biz"},
-                    {"id": "cp0"},
-                    {"id": "visitorReview"},
-                    {"id": "clip"},
-                    {"id": "imgSas"}
-                ]
+                photo_items = await intercept_and_save_graphql(page, business_id, output_path)
+                url = f"https://m.place.naver.com/restaurant/{business_id}/photo"
+                await page.goto(url, wait_until="networkidle")
 
-                # 페이지별로 사진 가져오기
-                for page_num in range(MAX_PAGES):
-                    print(f"📄 페이지 {page_num + 1} 요청 중...")
-                    
-                    # requests로 요청 (브라우저 쿠키 사용)
-                    data = make_request_with_cookies(business_id, cursors, browser_data)
-                    
-                    # 요청 실패 시 쿠키 갱신 후 재시도
-                    if not data:
-                        print(f"⚠️ 요청 실패 → 브라우저 쿠키 갱신 후 재시도")
-                        browser_data = await refresh_browser_cookies(page, business_id)
-                        cookie_refresh_count += 1
-                        
-                        # 쿠키 갱신 후 재시도
-                        data = make_request_with_cookies(business_id, cursors, browser_data)
-                        if not data:
-                            print(f"⚠️ 재시도 실패, 건너뜀")
-                            skip_count += 1
-                            break
-
-                    # 응답에서 사진 정보 추출
-                    viewer = data.get('data', {}).get('photoViewer', {})
-                    photos = viewer.get('photos') or []
-                    cursors_data = viewer.get('cursors', [])
-
-                    # 사진이 없으면 종료
-                    if not photos:
-                        print(f"⚠️ 사진 없음, 종료")
+                # 스크롤 다운 반복 (사진 더보기 로딩)
+                no_new_graphql_count = 0
+                last_photo_count = len(photo_items)
+                for scroll_num in range(MAX_SCROLL):
+                    await page.mouse.wheel(0, 1000)
+                    await asyncio.sleep(0.3)
+                    print(f"⏬ 스크롤 다운 {scroll_num+1}/{MAX_SCROLL}")
+                    if len(photo_items) == last_photo_count:
+                        no_new_graphql_count += 1
+                    else:
+                        no_new_graphql_count = 0
+                    last_photo_count = len(photo_items)
+                    if scroll_num >= 2 and no_new_graphql_count >= 2:
+                        print('⏹️ 더 이상 새로운 GraphQL 응답이 없습니다. 스크롤 종료.')
                         break
-
-                    # 각 사진 정보 저장
-                    for photo in photos:
-                        author = photo.get("author") or {}
-                        all_photos.append({
-                            "url": photo.get("originalUrl"),
-                            "desc": photo.get("desc"),
-                            "author": author.get("nickname"),
-                            "video": photo.get("video"),
-                            "width": photo.get("width"),
-                            "height": photo.get("height"),
-                            "date": photo.get("date"),
-                            "viewId": photo.get("viewId")
-                        })
-
-                    # 다음 페이지 커서 확인
-                    next_cursor = None
-                    for cursor in cursors_data:
-                        if cursor["id"] == "biz" and cursor.get("hasNext") and cursor.get("lastCursor"):
-                            next_cursor = cursor["lastCursor"]
-                    
-                    # 다음 페이지가 없으면 종료
-                    if not next_cursor:
-                        print(f"✅ 다음 커서 없음, 종료")
-                        break
-                        
-                    # 다음 페이지 커서 설정
-                    cursors[0] = {"id": "biz", "lastCursor": next_cursor}
-                    
-                    # 페이지 간 딜레이
-                    delay = random_delay()
-                    print(f"⏱️ 다음 페이지 요청까지 {delay:.1f}초 대기 중...")
 
                 # 사진 저장
-                if all_photos:
+                if photo_items:
                     filename = f"{db_id}_photo_{business_id}.jsonl"
-                    save_jsonl(filename, all_photos, output_path)
-                    print(f"✅ 저장 완료: {filename} ({len(all_photos)}장)")
+                    save_jsonl(filename, photo_items, output_path)
+                    print(f"✅ 저장 완료: {filename} ({len(photo_items)}장)")
                     success_count += 1
                 else:
                     print(f"⚠️ 수집된 사진 없음")
                     skip_count += 1
-                    
-                # 업체 간 딜레이
-                if db_id != business_ids[-1][0]:  # 마지막 업체가 아니면
-                    delay = random.uniform(1, 3)
-                    print(f"⏱️ 다음 업체 크롤링까지 {delay:.1f}초 대기 중...")
-                    time.sleep(delay)
+
+                # N개마다 브라우저 재시작
+                if (i + 1) % BROWSER_RESTART_INTERVAL == 0:
+                    await page.close()
+                    await context.close()
+                    await browser.close()
+                    print(f'🔄 브라우저 재시작: {i+1}번째 업체까지 완료')
+                    browser = await p.chromium.launch(headless=False)
+                    context = await browser.new_context(
+                        viewport={"width": 1280, "height": 800},
+                        user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36"
+                    )
+                    await block_images(context)
+                    page = await context.new_page()
 
             except Exception as e:
                 print(f"❌ 예외 발생: {e}")
-                log_failure(business_id, {}, error=str(e))
+                log_failure(business_id, error=str(e))
                 error_count += 1
-                # 에러 후 복구 시간
                 time.sleep(random.uniform(3, 5))
                 continue
 
-        # 브라우저 종료
         await browser.close()
 
-    # 결과 요약
     print("\n📊 크롤링 요약")
     print(f"🔢 전체 업체 수: {total}")
     print(f"✅ 성공: {success_count}")
     print(f"⚠️ 스킵: {skip_count}")
     print(f"❌ 실패: {error_count}")
-    print(f"🔄 쿠키 리프레시: {cookie_refresh_count}회")
 
 if __name__ == "__main__":
     asyncio.run(main())
